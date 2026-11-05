@@ -1,0 +1,5 @@
+chatterbox-tts
+fastapi
+uvicorn
+soundfile
+python-multipart
