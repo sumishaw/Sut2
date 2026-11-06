@@ -56,10 +56,20 @@ object Speaker {
     @Volatile private var curMp: MediaPlayer? = null
     @Volatile private var curLatch: CountDownLatch? = null
 
+    private val lastGender = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /** female/male for a speaker. Auto mode uses pitch with hysteresis so the voice does not flip-flop near the border. */
     private fun genderOf(p: Prefs, vid: String?): String {
         if (p.genderMode != "auto") return p.genderMode
-        val f0 = vid?.let { State.profileF0[it] }
-        return if (f0 != null) (if (f0 > 165f) "female" else "male") else State.gender
+        val key = vid ?: return State.gender
+        val f0 = State.profileF0[key] ?: return State.gender
+        val g = when {
+            f0 > 180f -> "female"
+            f0 < 150f -> "male"
+            else -> lastGender[key] ?: if (f0 > 165f) "female" else "male"
+        }
+        lastGender[key] = g
+        return g
     }
 
     fun serverFor(p: Prefs, engine: String) = when (engine) {
@@ -77,7 +87,7 @@ object Speaker {
     /** Stop everything right now: queued lines, the line being played, device speech. */
     fun stopAll(ctx: Context) {
         epoch++
-        jobs.clear()
+        jobs.clear(); lastGender.clear()
         playQ.forEach { it.delete() }; playQ.clear()
         val busy = inFlight.getAndSet(0) > 0
         curLatch?.countDown()
@@ -103,7 +113,7 @@ object Speaker {
                 } catch (e: Exception) {
                     if (j.epoch != epoch) continue
                     State.status = "Server problem (${e.message}) -> device voice"
-                    if (p.fallback) DeviceTts.speak(app, j.text, genderOf(p, null), p.lang)
+                    if (p.fallback) DeviceTts.speak(app, j.text, genderOf(p, j.spk.ifEmpty { null }), p.lang)
                     finishOne()
                 }
             }
@@ -123,7 +133,7 @@ object Speaker {
         val app = ctx.applicationContext
         appCtx = app
         val p = Prefs(app)
-        if (p.engine == "device") { DeviceTts.speak(app, text, genderOf(p, null), p.lang); return }
+        if (p.engine == "device") { DeviceTts.speak(app, text, genderOf(p, spk.ifEmpty { null }), p.lang); return }
         if (p.pauseVideo && inFlight.get() == 0) Media.key(app, KeyEvent.KEYCODE_MEDIA_PAUSE)
         inFlight.incrementAndGet()
         start()
