@@ -142,8 +142,7 @@ class MainActivity : android.app.Activity() {
                 status.text = "Status: ${State.status}\nDetected voice: ${State.gender}\nCloned voice: " +
                         (if (p.voiceId.isEmpty()) "none" else p.voiceId) + "\nLast caption: ${State.lastCaption}"
                 dbgView.text = "Audio capture: frames=${State.audioFrames} loud=${State.audioLoud} speaker=${State.gender}\n" +
-                        "Video-voice refs: female=${if (java.io.File(filesDir, "auto_female.wav").exists()) "yes" else "no"} " +
-                        "male=${if (java.io.File(filesDir, "auto_male.wav").exists()) "yes" else "no"}\n" +
+                        "Current voice: ${State.speaker.ifEmpty { "?" }} (${State.gender})  clone refs: ${State.created.keys.sorted().joinToString()}\n" +
                         "Captions app: ${State.pkg} events=${State.events}\n${State.debug}\nOCR: ${State.ocrText}"
                 ui.postDelayed(this, 1000)
             }
