@@ -18,6 +18,15 @@ object DeviceTts {
         }
     }
 
+    fun stop() { try { tts?.stop() } catch (_: Exception) {} }
+
+    /** Best-guess pick of Google's Hindi voices when the user has not chosen one (hic = male, hia = female). */
+    private fun autoVoice(t: TextToSpeech, gender: String): Voice? {
+        val hint = if (gender == "male") "hic" else "hia"
+        val l = (t.voices ?: emptySet()).filter { it.locale.language == "hi" && it.name.contains(hint) }
+        return l.firstOrNull { it.name.contains("local") } ?: l.firstOrNull()
+    }
+
     fun voices(lang: String): List<Voice> =
         if (!ready) emptyList()
         else (tts?.voices ?: emptySet()).filter { it.locale.language == lang }.sortedBy { it.name }
@@ -32,9 +41,10 @@ object DeviceTts {
             State.status = "Install '$tag' voice data (button in app)"; return
         }
         val name = if (gender == "male") p.devMale else p.devFemale
-        val v = t.voices?.firstOrNull { it.name == name }
-        if (v != null) { t.voice = v; t.setPitch(1f) }
-        else t.setPitch(if (gender == "male") 0.85f else 1.1f)   // crude gender hint when no voice chosen
+        val v = t.voices?.firstOrNull { it.name == name } ?: autoVoice(t, gender)
+        if (v != null) t.voice = v
+        t.setPitch(1f)                       // pitch-shifting is what made the male voice sound robotic
+        t.setSpeechRate(1.1f)
         State.muteUntil = System.currentTimeMillis() + maxOf(2500L, text.length * 90L)
         t.speak(text, TextToSpeech.QUEUE_ADD, null, "u${System.nanoTime()}")
         State.status = "spoke (device/$gender)"
