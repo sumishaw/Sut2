@@ -82,10 +82,6 @@ class MainActivity : android.app.Activity() {
             setOnCheckedChangeListener { _, c -> p.enabled = c }
         })
         root.addView(Switch(this).apply {
-            text = "Aggressive caption detection (experimental)"; isChecked = p.aggressive
-            setOnCheckedChangeListener { _, c -> p.aggressive = c }
-        })
-        root.addView(Switch(this).apply {
             text = "Read Hindi subtitles from the screen (OCR; use fullscreen) - restart capture after changing"; isChecked = p.ocr
             setOnCheckedChangeListener { _, c -> p.ocr = c }
         })
@@ -145,7 +141,10 @@ class MainActivity : android.app.Activity() {
             override fun run() {
                 status.text = "Status: ${State.status}\nDetected voice: ${State.gender}\nCloned voice: " +
                         (if (p.voiceId.isEmpty()) "none" else p.voiceId) + "\nLast caption: ${State.lastCaption}"
-                dbgView.text = "A11y app: ${State.pkg} events=${State.events}\n${State.debug}\nOCR: ${State.ocrText}"
+                dbgView.text = "Audio capture: frames=${State.audioFrames} loud=${State.audioLoud} speaker=${State.gender}\n" +
+                        "Video-voice refs: female=${if (java.io.File(filesDir, "auto_female.wav").exists()) "yes" else "no"} " +
+                        "male=${if (java.io.File(filesDir, "auto_male.wav").exists()) "yes" else "no"}\n" +
+                        "Captions app: ${State.pkg} events=${State.events}\n${State.debug}\nOCR: ${State.ocrText}"
                 ui.postDelayed(this, 1000)
             }
         })
@@ -162,7 +161,8 @@ class MainActivity : android.app.Activity() {
     }
 
     private fun save() { p.xttsUrl = xtts.text.toString(); p.cbUrl = cb.text.toString(); p.localUrl = local.text.toString(); p.lang = lang.text.toString() }
-    override fun onPause() { save(); super.onPause() }
+    override fun onPause() { save(); State.appVisible = false; super.onPause() }
+    override fun onResume() { super.onResume(); State.appVisible = true }
 
     @Deprecated("simple")
     override fun onActivityResult(req: Int, res: Int, data: Intent?) {
