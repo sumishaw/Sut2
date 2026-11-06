@@ -248,7 +248,7 @@ class AudioCaptureService : Service() {
                 }
             } catch (e: InterruptedException) { break
             } catch (e: Exception) { if (running) State.status = "OCR: ${e.message}" }
-            try { Thread.sleep(350) } catch (e: InterruptedException) { break }
+            try { Thread.sleep(120) } catch (e: InterruptedException) { break }
         }
     }
 
