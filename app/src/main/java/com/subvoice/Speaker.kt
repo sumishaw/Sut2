@@ -3,6 +3,7 @@ package com.subvoice
 import android.content.Context
 import android.media.AudioManager
 import android.media.MediaPlayer
+import android.media.PlaybackParams
 import android.view.KeyEvent
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
@@ -13,8 +14,11 @@ import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.concurrent.thread
+import kotlin.math.abs
 
 object Net {
     val client: OkHttpClient = OkHttpClient.Builder()
@@ -34,62 +38,99 @@ object Media {
     }
 }
 
+/**
+ * Two-stage pipeline: generation thread -> play thread. The next line is generated while the
+ * previous one is still playing; when lines pile up, playback speeds up (up to 1.36x) to catch up.
+ */
 object Speaker {
-    private val ex = Executors.newSingleThreadExecutor()
-    private val queued = AtomicInteger(0)
+    private val genEx = Executors.newSingleThreadExecutor()
+    private val playQ = LinkedBlockingQueue<File>()
+    private val inFlight = AtomicInteger(0)          // lines being generated, waiting or playing
+    @Volatile private var appCtx: Context? = null
+    @Volatile private var playerStarted = false
 
-    private fun gender(p: Prefs) = if (p.genderMode == "auto") State.gender else p.genderMode
+    private fun genderOf(p: Prefs, vid: String?): String {
+        if (p.genderMode != "auto") return p.genderMode
+        val f0 = vid?.let { State.profileF0[it] }
+        return if (f0 != null) (if (f0 > 165f) "female" else "male") else State.gender
+    }
 
     fun serverFor(p: Prefs, engine: String) = when (engine) {
         "chatterbox" -> p.cbUrl; "local" -> p.localUrl; else -> p.xttsUrl
     }
 
-    fun enqueue(ctx: Context, text: String) {
-        val app = ctx.applicationContext
-        val p = Prefs(app)
-        if (p.engine == "device") { DeviceTts.speak(app, text, gender(p), p.lang); return }
-        if (queued.get() > 3) return            // can't keep up: drop instead of lagging further
-        if (p.pauseVideo && queued.get() == 0) Media.key(app, KeyEvent.KEYCODE_MEDIA_PAUSE)
-        queued.incrementAndGet()
-        ex.execute {
-            try { synth(app, p, text) }
-            catch (e: Exception) {
-                State.status = "Server problem (${e.message}) -> device voice"
-                if (p.fallback) DeviceTts.speak(app, text, gender(p), p.lang)
-            } finally {
-                if (queued.decrementAndGet() == 0 && p.pauseVideo) Media.key(app, KeyEvent.KEYCODE_MEDIA_PLAY)
+    private fun finishOne() {
+        val c = appCtx ?: return
+        if (inFlight.decrementAndGet() <= 0) {
+            inFlight.set(0)
+            if (Prefs(c).pauseVideo) Media.key(c, KeyEvent.KEYCODE_MEDIA_PLAY)
+        }
+    }
+
+    private fun startPlayer() {
+        if (playerStarted) return
+        playerStarted = true
+        thread(name = "player", isDaemon = true) {
+            while (true) {
+                val f = playQ.take()
+                try { play(f, 1.0f + 0.12f * (inFlight.get() - 1).coerceIn(0, 3)) } catch (_: Exception) {}
+                f.delete()
+                finishOne()
             }
         }
     }
 
-    private fun synth(ctx: Context, p: Prefs, text: String) {
+    fun enqueue(ctx: Context, text: String, spk: String = State.speaker) {
+        val app = ctx.applicationContext
+        appCtx = app
+        val p = Prefs(app)
+        if (p.engine == "device") { DeviceTts.speak(app, text, genderOf(p, null), p.lang); return }
+        if (inFlight.get() >= 5) return                       // hopelessly behind: skip instead of drifting further
+        if (p.pauseVideo && inFlight.get() == 0) Media.key(app, KeyEvent.KEYCODE_MEDIA_PAUSE)
+        inFlight.incrementAndGet()
+        startPlayer()
+        genEx.execute {
+            try { playQ.put(synth(app, p, text, spk)) }
+            catch (e: Exception) {
+                State.status = "Server problem (${e.message}) -> device voice"
+                if (p.fallback) DeviceTts.speak(app, text, genderOf(p, null), p.lang)
+                finishOne()
+            }
+        }
+    }
+
+    /** Reference of the speaker heard when the line appeared, or the closest-pitched available one. */
+    private fun pickRef(spk: String): String? {
+        val ready = State.created.keys.toList()
+        if (ready.isEmpty()) return null
+        if (spk.isNotEmpty() && spk in ready) return spk
+        val f0 = State.profileF0[spk] ?: State.profileF0[State.speaker]
+        return if (f0 == null) ready.first() else ready.minByOrNull { abs((State.profileF0[it] ?: 0f) - f0) }
+    }
+
+    private fun synth(ctx: Context, p: Prefs, text: String, spk: String): File {
         val engine = p.engine
         val cloned = engine == "local" || engine == "chatterbox"
-        val g = gender(p)
         var vid = p.voiceId
         if (cloned && p.autoRef) {
-            // use the reference captured from the video for the current speaker's gender (or the other one)
-            val mine = "auto_$g"
-            val other = if (g == "female") "auto_male" else "auto_female"
-            val pick = when {
-                File(ctx.filesDir, "$mine.wav").exists() -> mine
-                File(ctx.filesDir, "$other.wav").exists() -> other
-                else -> null
-            }
-            if (pick != null) { ensureAuto(ctx, pick); vid = pick } else if (vid.isNotEmpty()) ensureVoice(ctx, p)
+            val pick = pickRef(spk)
+            if (pick != null) { ensureAuto(ctx, pick); vid = pick }
+            else if (vid.isNotEmpty()) ensureVoice(ctx, p)
         } else if (cloned) ensureVoice(ctx, p)
         if (cloned && vid.isEmpty()) error("no voice reference yet - play the video with capture running")
+        val g = genderOf(p, vid)
         val lang = if (cloned) "hi" else p.lang                  // cloned engines: Hindi only
         val json = JSONObject().put("text", text).put("language", lang)
             .put("gender", g).put("voice_id", vid)
         val req = Request.Builder().url("${serverFor(p, engine)}/tts/$engine")
             .post(json.toString().toRequestBody("application/json".toMediaType())).build()
-        Net.client.newCall(req).execute().use { r ->
+        val t0 = System.currentTimeMillis()
+        return Net.client.newCall(req).execute().use { r ->
             if (!r.isSuccessful) error("HTTP ${r.code}")
             val f = File(ctx.cacheDir, "t${System.nanoTime()}.wav")
             f.writeBytes(r.body!!.bytes())
-            play(f)
-            State.status = "spoke ($engine/$vid/$g)"
+            State.status = "$engine/$vid/$g generated in ${(System.currentTimeMillis() - t0) / 1000}s"
+            f
         }
     }
 
@@ -103,7 +144,7 @@ object Speaker {
         if (up == null || up < (State.created[id] ?: 0L)) uploadAuto(ctx, id)
     }
 
-    /** Sends a voice captured from the video (auto_female / auto_male) to the local server. */
+    /** Sends a voice captured from the video (spk_1, spk_2 ...) to the local server. */
     fun uploadAuto(ctx: Context, id: String) {
         val p = Prefs(ctx)
         val f = File(ctx.filesDir, "$id.wav")
@@ -126,14 +167,16 @@ object Speaker {
         }
     }
 
-    private fun play(f: File) {
+    private fun play(f: File, speed: Float) {
         val latch = CountDownLatch(1)
         val mp = MediaPlayer()
-        mp.setDataSource(f.path)
-        mp.setOnCompletionListener { latch.countDown() }
-        mp.setOnErrorListener { _, _, _ -> latch.countDown(); true }
-        mp.prepare(); mp.start()
-        latch.await(60, TimeUnit.SECONDS)
-        mp.release(); f.delete()
+        try {
+            mp.setDataSource(f.path)
+            mp.setOnCompletionListener { latch.countDown() }
+            mp.setOnErrorListener { _, _, _ -> latch.countDown(); true }
+            mp.prepare(); mp.start()
+            if (speed > 1.02f) try { mp.playbackParams = PlaybackParams().setSpeed(speed) } catch (_: Exception) {}
+            latch.await(60, TimeUnit.SECONDS)
+        } finally { mp.release() }
     }
 }
