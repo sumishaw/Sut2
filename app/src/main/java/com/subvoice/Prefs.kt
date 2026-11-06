@@ -1,6 +1,6 @@
 package com.subvoice
 
-import android.content.Context
+import android.content.Context.  
 
 class Prefs(c: Context) {
     private val sp = c.getSharedPreferences("subvoice", Context.MODE_PRIVATE)
@@ -12,7 +12,7 @@ class Prefs(c: Context) {
     var xttsUrl: String get() = str("xtts", "http://192.168.1.10:8000"); set(v) = put("xtts", v.trim().trimEnd('/'))
     var cbUrl: String get() = str("cb", "http://192.168.1.10:8001"); set(v) = put("cb", v.trim().trimEnd('/'))
     var localUrl: String get() = str("local", "http://127.0.0.1:8002"); set(v) = put("local", v.trim().trimEnd('/'))
-    var engine: String get() = str("engine", "fast"); set(v) = put("engine", v)       // fast | local | device | xtts | chatterbox
+    var engine: String get() = str("engine", "local"); set(v) = put("engine", v)       // local (tablet voice + clone) | fast | device | xtts | chatterbox
     var genderMode: String get() = str("gender", "auto"); set(v) = put("gender", v)   // auto | female | male
     var lang: String get() = str("lang", "hi"); set(v) = put("lang", v.trim())
     var voiceId: String get() = str("voice", ""); set(v) = put("voice", v)
