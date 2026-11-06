@@ -2,13 +2,13 @@ package com.subvoice
 
 import android.accessibilityservice.AccessibilityService
 import android.content.Context
-import android.graphics.Rect
+import android.media.AudioManager
 import android.os.Handler
 import android.os.Looper
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 
-/** Reads subtitle text exposed through the accessibility tree (YouTube app, many browsers). */
+/** Reads subtitle text exposed by the video app itself (ids containing "caption"/"subtitle"). No general screen reading. */
 class CaptionService : AccessibilityService() {
     private var last = ""
     private var lastDbg = 0L
@@ -17,13 +17,14 @@ class CaptionService : AccessibilityService() {
         if (e == null || e.packageName == packageName) return
         State.pkg = e.packageName?.toString() ?: ""
         State.events++
-        val prefs = Prefs(this)
-        if (!prefs.enabled) return
+        if (!Prefs(this).enabled) return
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        if (!am.isMusicActive) return                      // only while a video/audio is playing
         val root = rootInActiveWindow ?: return
         val now = System.currentTimeMillis()
         val dbg: MutableList<String>? = if (now - lastDbg > 1500) { lastDbg = now; mutableListOf() } else null
         val sb = StringBuilder()
-        collect(root, prefs.aggressive, sb, resources.displayMetrics.heightPixels, dbg)
+        collect(root, sb, dbg)
         if (dbg != null) State.debug = dbg.joinToString("\n")
         val text = sb.toString().trim()
         if (text.isNotEmpty() && text != last) {
@@ -32,20 +33,15 @@ class CaptionService : AccessibilityService() {
         }
     }
 
-    private fun collect(n: AccessibilityNodeInfo?, aggressive: Boolean, out: StringBuilder, h: Int, dbg: MutableList<String>?) {
+    private fun collect(n: AccessibilityNodeInfo?, out: StringBuilder, dbg: MutableList<String>?) {
         if (n == null) return
         val id = n.viewIdResourceName?.lowercase() ?: ""
-        val txt = (n.text ?: n.contentDescription)?.toString()
+        val txt = n.text?.toString()
         if (!txt.isNullOrBlank()) {
-            if (dbg != null && dbg.size < 12) dbg.add(id.substringAfterLast('/') + ": " + txt.take(40))
-            if (id.contains("caption") || id.contains("subtitle")) {
-                out.append(txt).append(' ')
-            } else if (aggressive && !n.isClickable) {
-                val r = Rect(); n.getBoundsInScreen(r)
-                if (r.top > h * 0.30 && r.bottom < h * 0.85 && txt.length in 2..140) out.append(txt).append(' ')
-            }
+            if (dbg != null && dbg.size < 8) dbg.add(id.substringAfterLast('/') + ": " + txt.take(40))
+            if ((id.contains("caption") || id.contains("subtitle")) && !n.isClickable) out.append(txt).append(' ')
         }
-        for (i in 0 until n.childCount) collect(n.getChild(i), aggressive, out, h, dbg)
+        for (i in 0 until n.childCount) collect(n.getChild(i), out, dbg)
     }
 
     override fun onInterrupt() {}
