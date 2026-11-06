@@ -7,7 +7,7 @@ import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.content.res.Configuration
-import android.graphics.Bitmap
+import android.graphics.Bitmap 
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
@@ -22,7 +22,6 @@ import com.google.android.gms.tasks.Tasks
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.devanagari.DevanagariTextRecognizerOptions
-import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -36,6 +35,7 @@ import kotlin.math.sqrt
  *  2. screen OCR (on-device ML Kit, Devanagari) -> centred subtitle lines only, while a video is playing
  */
 class AudioCaptureService : Service() {
+    companion object { const val RING = 16000 * 8 }
     private var proj: MediaProjection? = null
     private var rec: AudioRecord? = null
     private var vd: VirtualDisplay? = null
@@ -85,13 +85,35 @@ class AudioCaptureService : Service() {
         thread(name = "audio") { audioLoop() }
     }
 
+    private class Prof(val id: String, var f0: Float) {
+        val ring = ShortArray(RING)
+        var pos = 0
+        var filled = 0
+        var lastSave = 0L
+        var lastUsed = 0L
+    }
+
+    /**
+     * Tracks who is speaking by pitch: a new voice profile is created when the pitch moves >15% for a
+     * sustained moment, and an existing profile is re-used when its pitch comes back. Every profile keeps a
+     * rolling buffer of its own latest 8 s of audio, saved (and re-saved every >=20 s) as its clone reference.
+     */
     private fun audioLoop() {
         val buf = ShortArray(1024)
-        val f0s = ArrayDeque<Float>()
-        val acc = mapOf("female" to ByteArrayOutputStream(), "male" to ByteArrayOutputStream())
-        val cnt = mutableMapOf("female" to 0, "male" to 0)
-        val last = mutableMapOf("female" to 0L, "male" to 0L)
+        val recent = ArrayDeque<Float>()
+        val profs = ArrayList<Prof>()
+        var cur: Prof? = null
+        var dev = 0
+        var seq = 0
         val prefs = Prefs(this)
+
+        fun findOrCreate(med: Float): Prof {
+            profs.firstOrNull { abs(med / it.f0 - 1f) < 0.15f }?.let { return it }
+            if (profs.size >= 6) profs.minByOrNull { it.lastUsed }?.let { profs.remove(it) }
+            seq++
+            return Prof("spk_$seq", med).also { profs.add(it) }
+        }
+
         while (running) {
             val n = rec?.read(buf, 0, buf.size) ?: break
             if (n < buf.size) continue
@@ -104,34 +126,45 @@ class AudioCaptureService : Service() {
             State.audioLoud++
             val f = f0(buf, e)
             if (f > 0f) {
-                f0s.addLast(f); if (f0s.size > 40) f0s.removeFirst()
-                if (f0s.size >= 8) State.gender = if (f0s.sorted()[f0s.size / 2] > 165f) "female" else "male"
-            }
-            val g = State.gender
-            if (prefs.autoRef && f0s.size >= 8 && now - last.getValue(g) > 180_000) {
-                val bb = ByteBuffer.allocate(buf.size * 2).order(ByteOrder.LITTLE_ENDIAN)
-                for (s in buf) bb.putShort(s)
-                acc.getValue(g).write(bb.array()); cnt[g] = cnt.getValue(g) + buf.size
-                if (cnt.getValue(g) >= 16000 * 8) {
-                    saveRef(g, acc.getValue(g).toByteArray())
-                    acc.getValue(g).reset(); cnt[g] = 0; last[g] = now
+                recent.addLast(f); if (recent.size > 12) recent.removeFirst()
+                if (recent.size >= 8) {
+                    val med = recent.sorted()[recent.size / 2]
+                    State.gender = if (med > 165f) "female" else "male"
+                    val c0 = cur
+                    if (c0 == null) {
+                        cur = findOrCreate(med)
+                    } else if (abs(med / c0.f0 - 1f) > 0.15f) {
+                        if (++dev >= 6) { cur = findOrCreate(med); dev = 0 }
+                    } else {
+                        dev = 0; c0.f0 = c0.f0 * 0.95f + med * 0.05f
+                    }
+                    cur?.let { State.speaker = it.id; State.profileF0[it.id] = it.f0; it.lastUsed = now }
                 }
             }
+            val c = cur ?: continue
+            if (!prefs.autoRef) continue
+            for (s in buf) { c.ring[c.pos] = s; c.pos = (c.pos + 1) % RING }
+            c.filled = minOf(RING, c.filled + buf.size)
+            val need = if (c.lastSave == 0L) 16000 * 5 else RING      // first reference after 5 s, then 8 s windows
+            if (c.filled >= need && now - c.lastSave > 20_000) { saveRef(c, need); c.lastSave = now }
         }
     }
 
-    private fun saveRef(g: String, pcm: ByteArray) {
-        val id = "auto_$g"
+    private fun saveRef(p: Prof, samples: Int) {
+        val total = minOf(samples, p.filled)
+        val pcm = ByteBuffer.allocate(total * 2).order(ByteOrder.LITTLE_ENDIAN)
+        val start = (p.pos - total + RING) % RING
+        for (i in 0 until total) pcm.putShort(p.ring[(start + i) % RING])
         val hdr = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
-        hdr.put("RIFF".toByteArray()); hdr.putInt(36 + pcm.size); hdr.put("WAVE".toByteArray())
+        hdr.put("RIFF".toByteArray()); hdr.putInt(36 + pcm.capacity()); hdr.put("WAVE".toByteArray())
         hdr.put("fmt ".toByteArray()); hdr.putInt(16); hdr.putShort(1); hdr.putShort(1)
         hdr.putInt(16000); hdr.putInt(32000); hdr.putShort(2); hdr.putShort(16)
-        hdr.put("data".toByteArray()); hdr.putInt(pcm.size)
-        File(filesDir, "$id.wav").outputStream().use { it.write(hdr.array()); it.write(pcm) }
-        State.created[id] = System.currentTimeMillis()
-        State.status = "captured $g voice from the video"
+        hdr.put("data".toByteArray()); hdr.putInt(pcm.capacity())
+        File(filesDir, "${p.id}.wav").outputStream().use { it.write(hdr.array()); it.write(pcm.array()) }
+        State.created[p.id] = System.currentTimeMillis()
+        State.status = "updated voice reference ${p.id}"
         thread {
-            try { Speaker.uploadAuto(applicationContext, id) }
+            try { Speaker.uploadAuto(applicationContext, p.id) }
             catch (e: Exception) { State.status = "reference upload: ${e.message}" }
         }
     }
