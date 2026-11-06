@@ -65,12 +65,20 @@ object Speaker {
     private fun synth(ctx: Context, p: Prefs, text: String) {
         val engine = p.engine
         val cloned = engine == "local" || engine == "chatterbox"
-        val useAuto = cloned && p.autoRef && File(ctx.filesDir, "auto_ref.wav").exists()
-        if (useAuto) {
-            if (State.autoUploaded == 0L || State.autoUploaded < State.autoCreated) uploadAuto(ctx)
-        } else if (cloned) ensureVoice(ctx, p)
-        val vid = if (useAuto) "auto" else p.voiceId
         val g = gender(p)
+        var vid = p.voiceId
+        if (cloned && p.autoRef) {
+            // use the reference captured from the video for the current speaker's gender (or the other one)
+            val mine = "auto_$g"
+            val other = if (g == "female") "auto_male" else "auto_female"
+            val pick = when {
+                File(ctx.filesDir, "$mine.wav").exists() -> mine
+                File(ctx.filesDir, "$other.wav").exists() -> other
+                else -> null
+            }
+            if (pick != null) { ensureAuto(ctx, pick); vid = pick } else if (vid.isNotEmpty()) ensureVoice(ctx, p)
+        } else if (cloned) ensureVoice(ctx, p)
+        if (cloned && vid.isEmpty()) error("no voice reference yet - play the video with capture running")
         val lang = if (cloned) "hi" else p.lang                  // cloned engines: Hindi only
         val json = JSONObject().put("text", text).put("language", lang)
             .put("gender", g).put("voice_id", vid)
@@ -81,7 +89,7 @@ object Speaker {
             val f = File(ctx.cacheDir, "t${System.nanoTime()}.wav")
             f.writeBytes(r.body!!.bytes())
             play(f)
-            State.status = "spoke ($engine/${if (useAuto) "video-voice" else "ref"}/$g)"
+            State.status = "spoke ($engine/$vid/$g)"
         }
     }
 
@@ -90,15 +98,20 @@ object Speaker {
         .addFormDataPart("file", "ref.audio", f.readBytes().toRequestBody("application/octet-stream".toMediaType()))
         .build()
 
-    /** Sends the voice captured from the video to the local server as voice "auto". */
-    fun uploadAuto(ctx: Context) {
+    private fun ensureAuto(ctx: Context, id: String) {
+        val up = State.uploaded[id]
+        if (up == null || up < (State.created[id] ?: 0L)) uploadAuto(ctx, id)
+    }
+
+    /** Sends a voice captured from the video (auto_female / auto_male) to the local server. */
+    fun uploadAuto(ctx: Context, id: String) {
         val p = Prefs(ctx)
-        val f = File(ctx.filesDir, "auto_ref.wav")
+        val f = File(ctx.filesDir, "$id.wav")
         if (!f.exists() || (p.engine != "local" && p.engine != "chatterbox")) return
         Net.client.newCall(Request.Builder().url(serverFor(p, p.engine) + "/voice")
-            .post(filePart("auto", f)).build()).execute().use {
-            if (!it.isSuccessful) error("auto voice upload HTTP ${it.code}")
-            State.autoUploaded = System.currentTimeMillis()
+            .post(filePart(id, f)).build()).execute().use {
+            if (!it.isSuccessful) error("voice upload HTTP ${it.code}")
+            State.uploaded[id] = System.currentTimeMillis()
         }
     }
 
