@@ -98,16 +98,16 @@ class MainActivity : android.app.Activity() {
             setOnCheckedChangeListener { _, c -> p.fallback = c }
         })
 
-        root.addView(label("Voice engine:  fast = natural Hindi voices from Termux, near real-time (no cloning) | local = cloned voice in Termux (slow) | device = system voice | xtts / chatterbox = cloud GPU"))
-        root.addView(spin(listOf("fast", "local", "device", "xtts", "chatterbox"), p.engine) { p.engine = it })
+        root.addView(label("Voice engine:  local = tablet Hindi voice + cloning of the video speaker (needs Termux server, near real-time) | fast = Kokoro voices from Termux (no cloning) | device = plain tablet voice | xtts / chatterbox = cloud GPU"))
+        root.addView(spin(listOf("local", "fast", "device", "xtts", "chatterbox"), p.engine) { p.engine = it })
         root.addView(label("Voice gender"))
         root.addView(spin(listOf("auto", "female", "male"), p.genderMode) { p.genderMode = it })
 
         root.addView(label("On-device Hindi voices (offline engine)"))
         femAd = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, mutableListOf("(default)"))
         maleAd = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, mutableListOf("(default)"))
-        root.addView(label("Female voice")); femSp = voiceSpin(femAd) { p.devFemale = it }; root.addView(femSp)
-        root.addView(label("Male voice")); maleSp = voiceSpin(maleAd) { p.devMale = it }; root.addView(maleSp)
+        root.addView(label("Female voice (tap one to hear it; choose the one that is Voice IV in system settings)")); femSp = voiceSpin(femAd) { if (it != p.devFemale) { p.devFemale = it; DeviceTts.preview(this, it) } }; root.addView(femSp)
+        root.addView(label("Male voice (tap one to hear it; choose the one that is Voice II in system settings)")); maleSp = voiceSpin(maleAd) { if (it != p.devMale) { p.devMale = it; DeviceTts.preview(this, it) } }; root.addView(maleSp)
         root.addView(btn("Install / update Hindi voice data") {
             try { startActivity(Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA)) }
             catch (e: Exception) { startActivity(Intent("com.android.settings.TTS_SETTINGS")) }
@@ -139,8 +139,13 @@ class MainActivity : android.app.Activity() {
 
         ui.post(object : Runnable {
             override fun run() {
-                status.text = "Capture: ${if (State.capturing) "RUNNING" else "stopped"}\nStatus: ${State.status}\nDetected voice: ${State.gender}\nCloned voice: " +
-                        (if (p.voiceId.isEmpty()) "none" else p.voiceId) + "\nLast caption: ${State.lastCaption}"
+                val cl = when {
+                    p.engine != "local" && p.engine != "chatterbox" -> "off (engine ${p.engine})"
+                    p.autoRef && State.created.isNotEmpty() -> State.speaker.ifEmpty { "video voice" }
+                    p.voiceId.isNotEmpty() -> p.voiceId
+                    else -> "waiting for reference"
+                }
+                status.text = "Capture: ${if (State.capturing) "RUNNING" else "stopped"}\nStatus: ${State.status}\nDetected voice: ${State.gender}\nCloned voice: $cl\nLast caption: ${State.lastCaption}"
                 dbgView.text = "Audio capture: frames=${State.audioFrames} loud=${State.audioLoud} speaker=${State.gender}\n" +
                         "Current voice: ${State.speaker.ifEmpty { "?" }} (${State.gender})  clone refs: ${State.created.keys.sorted().joinToString()}\n" +
                         "Captions app: ${State.pkg} events=${State.events}\n${State.debug}\nOCR: ${State.ocrText}"
