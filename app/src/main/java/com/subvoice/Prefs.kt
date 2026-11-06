@@ -21,7 +21,6 @@ class Prefs(c: Context) {
     var devMale: String get() = str("devM", ""); set(v) = put("devM", v)
     var fallback: Boolean get() = bool("fb", true); set(v) = putB("fb", v)
     var enabled: Boolean get() = bool("enabled", true); set(v) = putB("enabled", v)
-    var aggressive: Boolean get() = bool("aggr", false); set(v) = putB("aggr", v)
     var autoRef: Boolean get() = bool("auto", true); set(v) = putB("auto", v)         // clone the video's own speaker
     var ocr: Boolean get() = bool("ocr", true); set(v) = putB("ocr", v)               // read subtitles from the screen
     var pauseVideo: Boolean get() = bool("pause", false); set(v) = putB("pause", v)   // pause video while dubbing
@@ -35,7 +34,10 @@ object State {
     @Volatile var events = 0
     @Volatile var pkg = ""
     @Volatile var ocrText = ""
-    @Volatile var autoCreated = 0L
-    @Volatile var autoUploaded = 0L
+    @Volatile var audioFrames = 0
+    @Volatile var audioLoud = 0
+    @Volatile var appVisible = true   // SubVoice screen in front: never OCR our own UI
+    val created = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    val uploaded = java.util.concurrent.ConcurrentHashMap<String, Long>()
     @Volatile var muteUntil = 0L      // ignore captured audio while the on-device TTS is speaking
 }
