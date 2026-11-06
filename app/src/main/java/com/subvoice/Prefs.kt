@@ -1,6 +1,6 @@
 package com.subvoice
 
-import android.content.Context.  
+import android.content.Context
 
 class Prefs(c: Context) {
     private val sp = c.getSharedPreferences("subvoice", Context.MODE_PRIVATE)
