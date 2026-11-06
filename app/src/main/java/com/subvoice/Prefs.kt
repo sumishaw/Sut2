@@ -23,7 +23,7 @@ class Prefs(c: Context) {
     var enabled: Boolean get() = bool("enabled", true); set(v) = putB("enabled", v)
     var autoRef: Boolean get() = bool("auto", true); set(v) = putB("auto", v)         // clone the video's own speaker
     var ocr: Boolean get() = bool("ocr", true); set(v) = putB("ocr", v)               // read subtitles from the screen
-    var pauseVideo: Boolean get() = bool("pause", false); set(v) = putB("pause", v)   // pause video while dubbing
+    var pauseVideo: Boolean get() = bool("pause", true); set(v) = putB("pause", v)   // pause video while dubbing
 }
 
 object State {
@@ -34,6 +34,8 @@ object State {
     @Volatile var events = 0
     @Volatile var pkg = ""
     @Volatile var ocrText = ""
+    @Volatile var speaker = ""        // id of the voice profile currently heard in the video (spk_1, spk_2 ...)
+    val profileF0 = java.util.concurrent.ConcurrentHashMap<String, Float>()
     @Volatile var audioFrames = 0
     @Volatile var audioLoud = 0
     @Volatile var appVisible = true   // SubVoice screen in front: never OCR our own UI
