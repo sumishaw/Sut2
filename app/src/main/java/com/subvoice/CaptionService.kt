@@ -55,8 +55,10 @@ fun similar(a: String, b: String): Boolean {
 }
 
 /**
- * Debounces rolling/jittery captions and speaks only new text. Thread-safe entry point.
- * A caption that is replaced by a DIFFERENT line before its timer fires is spoken immediately instead of being lost.
+ * Debounces rolling/jittery captions and speaks only NEW text. Thread-safe entry point.
+ *  - a caption replaced by a DIFFERENT line before its timer fires is spoken immediately instead of being lost
+ *  - every spoken line is remembered for a while: OCR jitter, a two-line caption collapsing back to one line,
+ *    or the same line arriving from both the accessibility reader and OCR is NOT spoken again (no loops)
  */
 object Pipeline {
     private val h = Handler(Looper.getMainLooper())
@@ -65,15 +67,55 @@ object Pipeline {
     private var spoken = ""
     private var run: Runnable? = null
 
+    private class Said(val norm: String, val grams: Set<String>, val t: Long)
+    private val history = ArrayList<Said>()
+    private const val WINDOW_MS = 25_000L
+
     fun reset() {
         run?.let { h.removeCallbacks(it) }
         pending = ""; spoken = ""; done = true
+        synchronized(history) { history.clear() }
+    }
+
+    /** letters, digits and Devanagari vowel signs only (ignores punctuation, spaces, case). */
+    private fun norm(s: String): String = s.filter {
+        Character.isLetterOrDigit(it) ||
+            Character.getType(it).let { t -> t == Character.NON_SPACING_MARK.toInt() || t == Character.COMBINING_SPACING_MARK.toInt() }
+    }.lowercase()
+
+    private fun grams(n: String): Set<String> = if (n.length < 2) setOf(n) else n.windowed(2).toSet()
+
+    /** True when this text (or nearly all of it) was already spoken a moment ago. */
+    private fun alreadySpoken(text: String): Boolean {
+        val n = norm(text)
+        if (n.isEmpty()) return true
+        val g = grams(n)
+        val now = System.currentTimeMillis()
+        synchronized(history) {
+            history.removeAll { now - it.t > WINDOW_MS }
+            for (s in history) {
+                if (s.norm == n) return true
+                if (n.length >= 4 && s.norm.contains(n)) return true            // a part of an earlier line
+                if (n.length >= 6 && g.count { it in s.grams }.toDouble() / g.size >= 0.8) return true   // jittery re-read
+            }
+        }
+        return false
+    }
+
+    private fun remember(text: String) {
+        val n = norm(text)
+        if (n.isEmpty()) return
+        synchronized(history) {
+            history.add(Said(n, grams(n), System.currentTimeMillis()))
+            while (history.size > 12) history.removeAt(0)
+        }
     }
 
     /** What is new in [cur] compared with the line spoken before (handles rolling 2-line captions). */
     private fun newPart(cur: String): String {
         if (spoken.isEmpty()) return cur
         if (cur.startsWith(spoken)) return cur.removePrefix(spoken)
+        if (spoken.contains(cur)) return ""                              // caption shrank back to one of its lines
         if (similar(cur, spoken)) return ""
         for (k in minOf(spoken.length, cur.length - 1) downTo 6) {      // old tail == start of new text
             if (cur.startsWith(spoken.takeLast(k))) return cur.drop(k)
@@ -87,7 +129,8 @@ object Pipeline {
         val cur = pending
         val delta = newPart(cur).trim()
         spoken = cur
-        if (delta.length > 1) {
+        if (delta.length > 1 && !alreadySpoken(delta)) {
+            remember(delta)
             State.lastCaption = delta
             Speaker.enqueue(ctx.applicationContext, delta, State.speaker)
         }
@@ -102,7 +145,7 @@ object Pipeline {
             }
             pending = text; done = false
             run = Runnable { commit(ctx) }
-            h.postDelayed(run!!, 180)
+            h.postDelayed(run!!, 250)
         }
     }
 }
