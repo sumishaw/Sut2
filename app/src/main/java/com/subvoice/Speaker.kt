@@ -13,8 +13,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.CountDownLatch
-import java.util.concurrent.Executors
-import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.LinkedBlockingDeque
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
@@ -39,15 +38,21 @@ object Media {
 }
 
 /**
- * Two-stage pipeline: generation thread -> play thread. The next line is generated while the
- * previous one is still playing; when lines pile up, playback speeds up (up to 1.36x) to catch up.
+ * Real-time pipeline: generation thread -> play thread.
+ *  - only the newest 2 lines are kept waiting (older ones are dropped, so voice never drifts far behind the video)
+ *  - when lines pile up, playback speeds up (up to 1.36x)
+ *  - stopAll() instantly silences everything (used by Stop)
  */
 object Speaker {
-    private val genEx = Executors.newSingleThreadExecutor()
-    private val playQ = LinkedBlockingQueue<File>()
+    private class Job(val text: String, val spk: String, val epoch: Int)
+    private val jobs = LinkedBlockingDeque<Job>()
+    private val playQ = LinkedBlockingDeque<File>()
     private val inFlight = AtomicInteger(0)          // lines being generated, waiting or playing
     @Volatile private var appCtx: Context? = null
-    @Volatile private var playerStarted = false
+    @Volatile private var started = false
+    @Volatile private var epoch = 0
+    @Volatile private var curMp: MediaPlayer? = null
+    @Volatile private var curLatch: CountDownLatch? = null
 
     private fun genderOf(p: Prefs, vid: String?): String {
         if (p.genderMode != "auto") return p.genderMode
@@ -56,7 +61,7 @@ object Speaker {
     }
 
     fun serverFor(p: Prefs, engine: String) = when (engine) {
-        "chatterbox" -> p.cbUrl; "local" -> p.localUrl; else -> p.xttsUrl
+        "chatterbox" -> p.cbUrl; "local", "fast" -> p.localUrl; else -> p.xttsUrl
     }
 
     private fun finishOne() {
@@ -67,15 +72,47 @@ object Speaker {
         }
     }
 
-    private fun startPlayer() {
-        if (playerStarted) return
-        playerStarted = true
+    /** Stop everything right now: queued lines, the line being played, device speech. */
+    fun stopAll(ctx: Context) {
+        epoch++
+        jobs.clear()
+        playQ.forEach { it.delete() }; playQ.clear()
+        val busy = inFlight.getAndSet(0) > 0
+        curLatch?.countDown()
+        try { curMp?.stop() } catch (_: Exception) {}
+        DeviceTts.stop()
+        if (busy && Prefs(ctx).pauseVideo) Media.key(ctx, KeyEvent.KEYCODE_MEDIA_PLAY)
+    }
+
+    private fun start() {
+        if (started) return
+        started = true
+        thread(name = "gen", isDaemon = true) {
+            while (true) {
+                val j = jobs.take()
+                val app = appCtx ?: continue
+                if (j.epoch != epoch) continue                        // stopped meanwhile
+                val p = Prefs(app)
+                try {
+                    val f = synth(app, p, j.text, j.spk)
+                    if (j.epoch != epoch) { f.delete(); continue }
+                    while (playQ.size >= 2) playQ.pollFirst()?.let { it.delete(); finishOne() }
+                    playQ.put(f)
+                } catch (e: Exception) {
+                    if (j.epoch != epoch) continue
+                    State.status = "Server problem (${e.message}) -> device voice"
+                    if (p.fallback) DeviceTts.speak(app, j.text, genderOf(p, null), p.lang)
+                    finishOne()
+                }
+            }
+        }
         thread(name = "player", isDaemon = true) {
             while (true) {
                 val f = playQ.take()
-                try { play(f, 1.0f + 0.12f * (inFlight.get() - 1).coerceIn(0, 3)) } catch (_: Exception) {}
+                val ep = epoch
+                try { if (ep == epoch) play(f, 1.0f + 0.12f * (inFlight.get() - 1).coerceIn(0, 3)) } catch (_: Exception) {}
                 f.delete()
-                finishOne()
+                if (ep == epoch) finishOne()
             }
         }
     }
@@ -85,18 +122,11 @@ object Speaker {
         appCtx = app
         val p = Prefs(app)
         if (p.engine == "device") { DeviceTts.speak(app, text, genderOf(p, null), p.lang); return }
-        if (inFlight.get() >= 5) return                       // hopelessly behind: skip instead of drifting further
         if (p.pauseVideo && inFlight.get() == 0) Media.key(app, KeyEvent.KEYCODE_MEDIA_PAUSE)
         inFlight.incrementAndGet()
-        startPlayer()
-        genEx.execute {
-            try { playQ.put(synth(app, p, text, spk)) }
-            catch (e: Exception) {
-                State.status = "Server problem (${e.message}) -> device voice"
-                if (p.fallback) DeviceTts.speak(app, text, genderOf(p, null), p.lang)
-                finishOne()
-            }
-        }
+        start()
+        while (jobs.size >= 2) { if (jobs.pollFirst() != null) finishOne() }   // drop stale lines, keep the newest
+        jobs.put(Job(text, spk, epoch))
     }
 
     /** Reference of the speaker heard when the line appeared, or the closest-pitched available one. */
@@ -117,19 +147,21 @@ object Speaker {
             if (pick != null) { ensureAuto(ctx, pick); vid = pick }
             else if (vid.isNotEmpty()) ensureVoice(ctx, p)
         } else if (cloned) ensureVoice(ctx, p)
-        if (cloned && vid.isEmpty()) error("no voice reference yet - play the video with capture running")
-        val g = genderOf(p, vid)
-        val lang = if (cloned) "hi" else p.lang                  // cloned engines: Hindi only
+        // "local" with no reference yet -> use the fast built-in voice instead of failing
+        val route = if (engine == "local" && vid.isEmpty()) "fast" else engine
+        if (route == "chatterbox" && vid.isEmpty()) error("no voice reference yet - play the video with capture running")
+        val g = genderOf(p, if (spk.isNotEmpty()) spk else vid)
+        val lang = if (engine == "xtts" || engine == "device") p.lang else "hi"
         val json = JSONObject().put("text", text).put("language", lang)
-            .put("gender", g).put("voice_id", vid)
-        val req = Request.Builder().url("${serverFor(p, engine)}/tts/$engine")
+            .put("gender", g).put("voice_id", vid).put("speaker", spk)
+        val req = Request.Builder().url("${serverFor(p, engine)}/tts/$route")
             .post(json.toString().toRequestBody("application/json".toMediaType())).build()
         val t0 = System.currentTimeMillis()
         return Net.client.newCall(req).execute().use { r ->
             if (!r.isSuccessful) error("HTTP ${r.code}")
             val f = File(ctx.cacheDir, "t${System.nanoTime()}.wav")
             f.writeBytes(r.body!!.bytes())
-            State.status = "$engine/$vid/$g generated in ${(System.currentTimeMillis() - t0) / 1000}s"
+            State.status = "$route/$spk/$g generated in ${(System.currentTimeMillis() - t0)} ms"
             f
         }
     }
@@ -170,6 +202,7 @@ object Speaker {
     private fun play(f: File, speed: Float) {
         val latch = CountDownLatch(1)
         val mp = MediaPlayer()
+        curLatch = latch; curMp = mp
         try {
             mp.setDataSource(f.path)
             mp.setOnCompletionListener { latch.countDown() }
@@ -177,6 +210,6 @@ object Speaker {
             mp.prepare(); mp.start()
             if (speed > 1.02f) try { mp.playbackParams = PlaybackParams().setSpeed(speed) } catch (_: Exception) {}
             latch.await(60, TimeUnit.SECONDS)
-        } finally { mp.release() }
+        } finally { curMp = null; try { mp.release() } catch (_: Exception) {} }
     }
 }
