@@ -61,7 +61,13 @@ object Pipeline {
     private var spoken = ""
     private var run: Runnable? = null
 
+    fun reset() {
+        run?.let { h.removeCallbacks(it) }
+        pending = ""; spoken = ""
+    }
+
     fun onCaption(ctx: Context, text: String) {
+        if (text == pending) return          // same text re-read (OCR polls often): keep the running timer
         pending = text
         run?.let { h.removeCallbacks(it) }
         run = Runnable {
@@ -77,6 +83,6 @@ object Pipeline {
                 Speaker.enqueue(ctx.applicationContext, delta, State.speaker)
             }
         }
-        h.postDelayed(run!!, 450)
+        h.postDelayed(run!!, 250)
     }
 }
