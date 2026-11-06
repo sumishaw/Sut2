@@ -74,9 +74,9 @@ object Pipeline {
             spoken = cur
             if (delta.length > 1) {
                 State.lastCaption = delta
-                Speaker.enqueue(ctx.applicationContext, delta)
+                Speaker.enqueue(ctx.applicationContext, delta, State.speaker)
             }
         }
-        h.postDelayed(run!!, 600)
+        h.postDelayed(run!!, 450)
     }
 }
