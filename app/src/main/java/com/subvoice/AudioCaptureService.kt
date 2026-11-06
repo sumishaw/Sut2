@@ -1,6 +1,7 @@
 package com.subvoice
 
 import android.app.Notification
+import android.app.PendingIntent
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
@@ -21,6 +22,7 @@ import android.view.WindowManager
 import com.google.android.gms.tasks.Tasks
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.TextRecognizer
 import com.google.mlkit.vision.text.devanagari.DevanagariTextRecognizerOptions
 import java.io.File
 import java.nio.ByteBuffer
@@ -41,27 +43,33 @@ class AudioCaptureService : Service() {
     private var vd: VirtualDisplay? = null
     private var reader: ImageReader? = null
     @Volatile private var running = false
-    private val recognizer by lazy { TextRecognition.getClient(DevanagariTextRecognizerOptions.Builder().build()) }
+    private var recognizer: TextRecognizer? = null
+    private var audioT: Thread? = null
+    private var ocrT: Thread? = null
 
     override fun onBind(i: Intent?): IBinder? = null
 
     @Suppress("DEPRECATION")
     override fun onStartCommand(i: Intent?, flags: Int, startId: Int): Int {
-        if (i == null || i.action == "stop") { stopSelf(); return START_NOT_STICKY }
+        if (i == null || i.action == "stop") { fullStop(); return START_NOT_STICKY }
+        cleanup()                                   // a second Start must never leave the first capture running
         val ch = "cap"
         getSystemService(NotificationManager::class.java)
             .createNotificationChannel(NotificationChannel(ch, "SubVoice capture", NotificationManager.IMPORTANCE_LOW))
+        val stopPi = PendingIntent.getService(this, 7,
+            Intent(this, AudioCaptureService::class.java).setAction("stop"), PendingIntent.FLAG_IMMUTABLE)
         val n = Notification.Builder(this, ch).setContentTitle("SubVoice is reading subtitles and audio")
-            .setSmallIcon(android.R.drawable.ic_btn_speak_now).build()
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .addAction(Notification.Action.Builder(null, "STOP", stopPi).build()).build()
         startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
 
         val code = i.getIntExtra("code", 0)
-        val data = i.getParcelableExtra<Intent>("data") ?: return START_NOT_STICKY
+        val data = i.getParcelableExtra<Intent>("data") ?: run { stopSelf(); return START_NOT_STICKY }
         val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         proj = mpm.getMediaProjection(code, data).also {
             it.registerCallback(object : MediaProjection.Callback() {}, null)
         }
-        running = true
+        running = true; State.capturing = true
         State.audioFrames = 0; State.audioLoud = 0
         startAudio()
         if (Prefs(this).ocr) startOcr()
@@ -82,7 +90,7 @@ class AudioCaptureService : Service() {
         rec = AudioRecord.Builder().setAudioFormat(fmt).setAudioPlaybackCaptureConfig(cfg)
             .setBufferSizeInBytes(16000 * 2).build()
         rec!!.startRecording()
-        thread(name = "audio") { audioLoop() }
+        audioT = thread(name = "audio") { audioLoop() }
     }
 
     private class Prof(val id: String, var f0: Float) {
@@ -116,6 +124,7 @@ class AudioCaptureService : Service() {
 
         while (running) {
             val n = rec?.read(buf, 0, buf.size) ?: break
+            if (n < 0) break
             if (n < buf.size) continue
             State.audioFrames++
             val now = System.currentTimeMillis()
@@ -201,8 +210,9 @@ class AudioCaptureService : Service() {
     }
 
     private fun startOcr() {
+        recognizer = TextRecognition.getClient(DevanagariTextRecognizerOptions.Builder().build())
         setupDisplay()
-        thread(name = "ocr") { ocrLoop() }
+        ocrT = thread(name = "ocr") { ocrLoop() }
     }
 
     override fun onConfigurationChanged(c: Configuration) {
@@ -212,6 +222,7 @@ class AudioCaptureService : Service() {
 
     private fun ocrLoop() {
         val am = getSystemService(AUDIO_SERVICE) as AudioManager
+        val rc = recognizer ?: return
         while (running) {
             try {
                 val img = reader?.acquireLatestImage()
@@ -227,7 +238,7 @@ class AudioCaptureService : Service() {
                     val top = (h * 0.6).toInt()
                     val crop = Bitmap.createBitmap(full, 0, top, w, h - top)
                     val cw = crop.width
-                    val res = Tasks.await(recognizer.process(InputImage.fromBitmap(crop, 0)))
+                    val res = Tasks.await(rc.process(InputImage.fromBitmap(crop, 0)))
                     // subtitles are CENTRED; titles, comments and menus are left/right aligned
                     val lines = res.textBlocks.flatMap { it.lines }.filter { l ->
                         val b = l.boundingBox ?: return@filter false
@@ -235,8 +246,9 @@ class AudioCaptureService : Service() {
                     }.sortedBy { it.boundingBox!!.top }
                     handleOcr(lines.joinToString(" ") { it.text })
                 }
-            } catch (e: Exception) { State.status = "OCR: ${e.message}" }
-            Thread.sleep(800)
+            } catch (e: InterruptedException) { break
+            } catch (e: Exception) { if (running) State.status = "OCR: ${e.message}" }
+            try { Thread.sleep(350) } catch (e: InterruptedException) { break }
         }
     }
 
@@ -250,11 +262,34 @@ class AudioCaptureService : Service() {
         Pipeline.onCaption(applicationContext, text)
     }
 
-    override fun onDestroy() {
+    /** Stops threads and releases every capture resource. Safe to call repeatedly. */
+    private fun cleanup() {
         running = false
-        try { rec?.stop(); rec?.release() } catch (_: Exception) {}
-        try { vd?.release(); reader?.close(); recognizer.close() } catch (_: Exception) {}
-        proj?.stop()
+        try { rec?.stop() } catch (_: Exception) {}           // unblocks the audio thread
+        audioT?.interrupt(); ocrT?.interrupt()
+        try { audioT?.join(600); ocrT?.join(600) } catch (_: Exception) {}
+        audioT = null; ocrT = null
+        try { rec?.release() } catch (_: Exception) {}; rec = null
+        try { vd?.release() } catch (_: Exception) {}; vd = null
+        try { reader?.close() } catch (_: Exception) {}; reader = null
+        try { recognizer?.close() } catch (_: Exception) {}; recognizer = null
+        try { proj?.stop() } catch (_: Exception) {}; proj = null
+        State.capturing = false
+    }
+
+    /** Stop button / notification: capture off, speech off, queues empty, display reset. */
+    private fun fullStop() {
+        cleanup()
+        Speaker.stopAll(this)
+        Pipeline.reset()
+        Prefs(this).enabled = false
+        State.resetCapture(this)
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    override fun onDestroy() {
+        cleanup()
         super.onDestroy()
     }
 }
