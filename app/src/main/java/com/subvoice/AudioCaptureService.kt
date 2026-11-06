@@ -27,12 +27,13 @@ import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.concurrent.thread
+import kotlin.math.abs
 import kotlin.math.sqrt
 
 /**
- * One screen-capture permission powers three things:
- *  1. playback-audio capture -> speaker gender guess + automatic voice-clone reference (8 s of the video's speaker)
- *  2. screen OCR (on-device ML Kit, Hindi/Devanagari) -> subtitles from ANY player
+ * One screen-capture permission powers:
+ *  1. playback-audio capture -> pitch-based speaker gender + SEPARATE female/male clone references (8 s each)
+ *  2. screen OCR (on-device ML Kit, Devanagari) -> centred subtitle lines only, while a video is playing
  */
 class AudioCaptureService : Service() {
     private var proj: MediaProjection? = null
@@ -61,17 +62,19 @@ class AudioCaptureService : Service() {
             it.registerCallback(object : MediaProjection.Callback() {}, null)
         }
         running = true
+        State.audioFrames = 0; State.audioLoud = 0
         startAudio()
         if (Prefs(this).ocr) startOcr()
         State.status = "capture running"
         return START_NOT_STICKY
     }
 
-    // ---------------- audio: gender + automatic clone reference ----------------
+    // ---------------- audio: gender + per-gender clone references ----------------
     private fun startAudio() {
         val cfg = AudioPlaybackCaptureConfiguration.Builder(proj!!)
             .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
             .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+            .addMatchingUsage(AudioAttributes.USAGE_GAME)
             .excludeUid(Process.myUid())
             .build()
         val fmt = AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT)
@@ -85,46 +88,50 @@ class AudioCaptureService : Service() {
     private fun audioLoop() {
         val buf = ShortArray(1024)
         val f0s = ArrayDeque<Float>()
-        val voiced = ByteArrayOutputStream()
-        var voicedSamples = 0
-        var lastRefAt = 0L
+        val acc = mapOf("female" to ByteArrayOutputStream(), "male" to ByteArrayOutputStream())
+        val cnt = mutableMapOf("female" to 0, "male" to 0)
+        val last = mutableMapOf("female" to 0L, "male" to 0L)
         val prefs = Prefs(this)
         while (running) {
             val n = rec?.read(buf, 0, buf.size) ?: break
             if (n < buf.size) continue
+            State.audioFrames++
             val now = System.currentTimeMillis()
-            if (now < State.muteUntil) continue            // our own on-device TTS is speaking
+            if (now < State.muteUntil) continue            // on-device TTS is speaking
             var e = 0.0
             for (s in buf) e += s.toDouble() * s
             if (sqrt(e / buf.size) < 400) continue         // silence
+            State.audioLoud++
             val f = f0(buf, e)
             if (f > 0f) {
                 f0s.addLast(f); if (f0s.size > 40) f0s.removeFirst()
                 if (f0s.size >= 8) State.gender = if (f0s.sorted()[f0s.size / 2] > 165f) "female" else "male"
             }
-            if (prefs.autoRef && now - lastRefAt > 90_000) {
+            val g = State.gender
+            if (prefs.autoRef && f0s.size >= 8 && now - last.getValue(g) > 180_000) {
                 val bb = ByteBuffer.allocate(buf.size * 2).order(ByteOrder.LITTLE_ENDIAN)
                 for (s in buf) bb.putShort(s)
-                voiced.write(bb.array()); voicedSamples += buf.size
-                if (voicedSamples >= 16000 * 8) {
-                    saveRef(voiced.toByteArray())
-                    voiced.reset(); voicedSamples = 0; lastRefAt = now
+                acc.getValue(g).write(bb.array()); cnt[g] = cnt.getValue(g) + buf.size
+                if (cnt.getValue(g) >= 16000 * 8) {
+                    saveRef(g, acc.getValue(g).toByteArray())
+                    acc.getValue(g).reset(); cnt[g] = 0; last[g] = now
                 }
             }
         }
     }
 
-    private fun saveRef(pcm: ByteArray) {
+    private fun saveRef(g: String, pcm: ByteArray) {
+        val id = "auto_$g"
         val hdr = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
         hdr.put("RIFF".toByteArray()); hdr.putInt(36 + pcm.size); hdr.put("WAVE".toByteArray())
         hdr.put("fmt ".toByteArray()); hdr.putInt(16); hdr.putShort(1); hdr.putShort(1)
         hdr.putInt(16000); hdr.putInt(32000); hdr.putShort(2); hdr.putShort(16)
         hdr.put("data".toByteArray()); hdr.putInt(pcm.size)
-        File(filesDir, "auto_ref.wav").outputStream().use { it.write(hdr.array()); it.write(pcm) }
-        State.autoCreated = System.currentTimeMillis()
-        State.status = "voice reference captured from the video"
+        File(filesDir, "$id.wav").outputStream().use { it.write(hdr.array()); it.write(pcm) }
+        State.created[id] = System.currentTimeMillis()
+        State.status = "captured $g voice from the video"
         thread {
-            try { Speaker.uploadAuto(applicationContext) }
+            try { Speaker.uploadAuto(applicationContext, id) }
             catch (e: Exception) { State.status = "reference upload: ${e.message}" }
         }
     }
@@ -141,7 +148,7 @@ class AudioCaptureService : Service() {
         return if (best > 0.45 && bl > 0) 16000f / bl else 0f
     }
 
-    // ---------------- screen OCR for subtitles ----------------
+    // ---------------- screen OCR (centred subtitle lines only) ----------------
     @Suppress("DEPRECATION")
     @Synchronized
     private fun setupDisplay() {
@@ -167,32 +174,41 @@ class AudioCaptureService : Service() {
 
     override fun onConfigurationChanged(c: Configuration) {
         super.onConfigurationChanged(c)
-        if (vd != null) setupDisplay()        // rotate to fullscreen landscape -> follow it
+        if (vd != null) setupDisplay()
     }
 
     private fun ocrLoop() {
+        val am = getSystemService(AUDIO_SERVICE) as AudioManager
         while (running) {
             try {
                 val img = reader?.acquireLatestImage()
-                if (img != null) {
+                // read only while a video is playing and SubVoice's own screen is not in front
+                if (img != null && (State.appVisible || !am.isMusicActive)) { img.close(); State.ocrText = "(idle)" }
+                else if (img != null) {
                     val w = img.width; val h = img.height
                     val pl = img.planes[0]
                     val rowPad = pl.rowStride - pl.pixelStride * w
                     val full = Bitmap.createBitmap(w + rowPad / pl.pixelStride, h, Bitmap.Config.ARGB_8888)
                     full.copyPixelsFromBuffer(pl.buffer)
                     img.close()
-                    val top = (h * 0.6).toInt()                       // subtitles live in the lower part
+                    val top = (h * 0.6).toInt()
                     val crop = Bitmap.createBitmap(full, 0, top, w, h - top)
-                    val text = Tasks.await(recognizer.process(InputImage.fromBitmap(crop, 0)))
-                        .text.replace('\n', ' ').trim()
-                    handleOcr(text)
+                    val cw = crop.width
+                    val res = Tasks.await(recognizer.process(InputImage.fromBitmap(crop, 0)))
+                    // subtitles are CENTRED; titles, comments and menus are left/right aligned
+                    val lines = res.textBlocks.flatMap { it.lines }.filter { l ->
+                        val b = l.boundingBox ?: return@filter false
+                        abs((b.left + b.right) / 2f - cw / 2f) < cw * 0.18f && b.width() < cw * 0.95f
+                    }.sortedBy { it.boundingBox!!.top }
+                    handleOcr(lines.joinToString(" ") { it.text })
                 }
             } catch (e: Exception) { State.status = "OCR: ${e.message}" }
             Thread.sleep(800)
         }
     }
 
-    private fun handleOcr(text: String) {
+    private fun handleOcr(text0: String) {
+        val text = text0.replace('\n', ' ').trim()
         State.ocrText = text
         val letters = text.filter { !it.isWhitespace() }
         if (letters.length < 3) return
