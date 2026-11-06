@@ -30,6 +30,7 @@ class MainActivity : android.app.Activity() {
     private lateinit var local: EditText
     private lateinit var femAd: ArrayAdapter<String>
     private lateinit var maleAd: ArrayAdapter<String>
+    private lateinit var enabledSw: Switch
     private lateinit var femSp: Spinner
     private lateinit var maleSp: Spinner
     private val ui = Handler(Looper.getMainLooper())
@@ -73,14 +74,13 @@ class MainActivity : android.app.Activity() {
             val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             startActivityForResult(mpm.createScreenCaptureIntent(), 2)
         })
-        root.addView(btn("Stop capture") {
-            startService(Intent(this, AudioCaptureService::class.java).setAction("stop"))
-        })
+        root.addView(btn("Stop capture") { stopEverything() })
 
-        root.addView(Switch(this).apply {
+        enabledSw = Switch(this).apply {
             text = "Speak captions"; isChecked = p.enabled
-            setOnCheckedChangeListener { _, c -> p.enabled = c }
-        })
+            setOnCheckedChangeListener { _, c -> p.enabled = c; if (!c) { Speaker.stopAll(this@MainActivity); Pipeline.reset() } }
+        }
+        root.addView(enabledSw)
         root.addView(Switch(this).apply {
             text = "Read Hindi subtitles from the screen (OCR; use fullscreen) - restart capture after changing"; isChecked = p.ocr
             setOnCheckedChangeListener { _, c -> p.ocr = c }
@@ -98,8 +98,8 @@ class MainActivity : android.app.Activity() {
             setOnCheckedChangeListener { _, c -> p.fallback = c }
         })
 
-        root.addView(label("Voice engine:  device = system voice | local = cloned voice inside Termux on this tablet | xtts / chatterbox = cloud GPU"))
-        root.addView(spin(listOf("device", "local", "xtts", "chatterbox"), p.engine) { p.engine = it })
+        root.addView(label("Voice engine:  fast = natural Hindi voices from Termux, near real-time (no cloning) | local = cloned voice in Termux (slow) | device = system voice | xtts / chatterbox = cloud GPU"))
+        root.addView(spin(listOf("fast", "local", "device", "xtts", "chatterbox"), p.engine) { p.engine = it })
         root.addView(label("Voice gender"))
         root.addView(spin(listOf("auto", "female", "male"), p.genderMode) { p.genderMode = it })
 
@@ -131,7 +131,7 @@ class MainActivity : android.app.Activity() {
         })
         root.addView(btn("Test speak") {
             save()
-            Speaker.enqueue(this, if (p.lang == "hi" || p.engine == "chatterbox" || p.engine == "local") "नमस्ते, यह एक परीक्षण है।" else "Hello, this is a test.")
+            Speaker.enqueue(this, if (p.lang == "hi" || p.engine == "chatterbox" || p.engine == "local" || p.engine == "fast") "नमस्ते, यह एक परीक्षण है।" else "Hello, this is a test.")
         })
 
         setContentView(ScrollView(this).apply { addView(root) })
@@ -139,11 +139,12 @@ class MainActivity : android.app.Activity() {
 
         ui.post(object : Runnable {
             override fun run() {
-                status.text = "Status: ${State.status}\nDetected voice: ${State.gender}\nCloned voice: " +
+                status.text = "Capture: ${if (State.capturing) "RUNNING" else "stopped"}\nStatus: ${State.status}\nDetected voice: ${State.gender}\nCloned voice: " +
                         (if (p.voiceId.isEmpty()) "none" else p.voiceId) + "\nLast caption: ${State.lastCaption}"
                 dbgView.text = "Audio capture: frames=${State.audioFrames} loud=${State.audioLoud} speaker=${State.gender}\n" +
                         "Current voice: ${State.speaker.ifEmpty { "?" }} (${State.gender})  clone refs: ${State.created.keys.sorted().joinToString()}\n" +
                         "Captions app: ${State.pkg} events=${State.events}\n${State.debug}\nOCR: ${State.ocrText}"
+                if (enabledSw.isChecked != p.enabled) enabledSw.isChecked = p.enabled
                 ui.postDelayed(this, 1000)
             }
         })
@@ -168,10 +169,24 @@ class MainActivity : android.app.Activity() {
         super.onActivityResult(req, res, data)
         if (res != RESULT_OK || data == null) return
         when (req) {
-            2 -> startForegroundService(Intent(this, AudioCaptureService::class.java)
-                .putExtra("code", res).putExtra("data", data))
+            2 -> {
+                p.enabled = true; enabledSw.isChecked = true
+                startForegroundService(Intent(this, AudioCaptureService::class.java)
+                    .putExtra("code", res).putExtra("data", data))
+            }
             3 -> data.data?.let { upload(it) }
         }
+    }
+
+    /** Stop: end capture, silence all speech, clear queues, switch caption speaking off. */
+    private fun stopEverything() {
+        stopService(Intent(this, AudioCaptureService::class.java))
+        Speaker.stopAll(this)
+        Pipeline.reset()
+        p.enabled = false
+        enabledSw.isChecked = false
+        State.resetCapture(this)
+        toast("Stopped. Turn on 'Speak captions' and start capture again to resume.")
     }
 
     private fun toast(m: String) = runOnUiThread { Toast.makeText(this, m, Toast.LENGTH_LONG).show() }
