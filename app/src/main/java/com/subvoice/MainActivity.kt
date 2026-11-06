@@ -34,6 +34,7 @@ class MainActivity : android.app.Activity() {
     private lateinit var femSp: Spinner
     private lateinit var maleSp: Spinner
     private val ui = Handler(Looper.getMainLooper())
+    private var voiceNames: List<String> = emptyList()
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
@@ -52,11 +53,14 @@ class MainActivity : android.app.Activity() {
                 override fun onNothingSelected(a: AdapterView<*>?) {}
             }
         }
-        fun voiceSpin(ad: ArrayAdapter<String>, on: (String) -> Unit) = Spinner(this).apply {
+        fun voiceSpin(ad: ArrayAdapter<String>, gender: String) = Spinner(this).apply {
             adapter = ad
             onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
                 override fun onItemSelected(a: AdapterView<*>?, v: View?, i: Int, id: Long) {
-                    if (ad.count > 1) on(if (i == 0) "" else ad.getItem(i)!!)   // ignore until list is loaded
+                    val name = voiceNames.getOrNull(i) ?: return
+                    if (name == DeviceTts.resolveName(p, gender)) return       // no change (also ignores the automatic call after loading)
+                    if (gender == "male") p.devMale = name else p.devFemale = name
+                    DeviceTts.preview(this@MainActivity, name)
                 }
                 override fun onNothingSelected(a: AdapterView<*>?) {}
             }
@@ -104,10 +108,10 @@ class MainActivity : android.app.Activity() {
         root.addView(spin(listOf("auto", "female", "male"), p.genderMode) { p.genderMode = it })
 
         root.addView(label("On-device Hindi voices (offline engine)"))
-        femAd = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, mutableListOf("(default)"))
-        maleAd = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, mutableListOf("(default)"))
-        root.addView(label("Female voice (tap one to hear it; choose the one that is Voice IV in system settings)")); femSp = voiceSpin(femAd) { if (it != p.devFemale) { p.devFemale = it; DeviceTts.preview(this, it) } }; root.addView(femSp)
-        root.addView(label("Male voice (tap one to hear it; choose the one that is Voice II in system settings)")); maleSp = voiceSpin(maleAd) { if (it != p.devMale) { p.devMale = it; DeviceTts.preview(this, it) } }; root.addView(maleSp)
+        femAd = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, mutableListOf("(loading voices...)"))
+        maleAd = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, mutableListOf("(loading voices...)"))
+        root.addView(label("Female voice - default Voice II (tap one to hear it; Voice I, II, III, IV = order in system Hindi (India) voices)")); femSp = voiceSpin(femAd, "female"); root.addView(femSp)
+        root.addView(label("Male voice - default Voice IV (tap one to hear it)")); maleSp = voiceSpin(maleAd, "male"); root.addView(maleSp)
         root.addView(btn("Install / update Hindi voice data") {
             try { startActivity(Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA)) }
             catch (e: Exception) { startActivity(Intent("com.android.settings.TTS_SETTINGS")) }
@@ -157,10 +161,12 @@ class MainActivity : android.app.Activity() {
 
     private fun loadVoices() = DeviceTts.init(this) {
         runOnUiThread {
-            val names = DeviceTts.voices("hi").map { it.name }
-            for ((ad, sp, cur) in listOf(Triple(femAd, femSp, p.devFemale), Triple(maleAd, maleSp, p.devMale))) {
-                ad.clear(); ad.add("(default)"); ad.addAll(names)
-                sp.setSelection(ad.getPosition(cur).coerceAtLeast(0))
+            val vs = DeviceTts.installedVoices("hi")
+            voiceNames = vs.map { it.name }
+            val labels = if (vs.isEmpty()) listOf("(no Hindi voice installed)") else vs.mapIndexed { i, v -> DeviceTts.label(i, v) }
+            for ((ad, sp, g) in listOf(Triple(femAd, femSp, "female"), Triple(maleAd, maleSp, "male"))) {
+                ad.clear(); ad.addAll(labels); ad.notifyDataSetChanged()
+                sp.setSelection(voiceNames.indexOf(DeviceTts.resolveName(p, g)).coerceAtLeast(0))
             }
         }
     }
