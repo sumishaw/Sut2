@@ -39,11 +39,13 @@ object Media {
 
 /**
  * Real-time pipeline: generation thread -> play thread.
- *  - only the newest 2 lines are kept waiting (older ones are dropped, so voice never drifts far behind the video)
- *  - when lines pile up, playback speeds up (up to 1.36x)
+ *  - NO line is skipped normally: when lines pile up playback speeds up (up to 1.5x) instead;
+ *    only a really long backlog (MAX_BACKLOG lines) drops the oldest ones
+ *  - engine "local" = tablet Hindi voice rendered to a file (instant) -> Termux server /convert re-voices it to the video speaker
  *  - stopAll() instantly silences everything (used by Stop)
  */
 object Speaker {
+    private const val MAX_BACKLOG = 7
     private class Job(val text: String, val spk: String, val epoch: Int)
     private val jobs = LinkedBlockingDeque<Job>()
     private val playQ = LinkedBlockingDeque<File>()
@@ -96,7 +98,7 @@ object Speaker {
                 try {
                     val f = synth(app, p, j.text, j.spk)
                     if (j.epoch != epoch) { f.delete(); continue }
-                    while (playQ.size >= 2) playQ.pollFirst()?.let { it.delete(); finishOne() }
+                    while (playQ.size >= MAX_BACKLOG) playQ.pollFirst()?.let { it.delete(); finishOne() }
                     playQ.put(f)
                 } catch (e: Exception) {
                     if (j.epoch != epoch) continue
@@ -110,7 +112,7 @@ object Speaker {
             while (true) {
                 val f = playQ.take()
                 val ep = epoch
-                try { if (ep == epoch) play(f, 1.0f + 0.12f * (inFlight.get() - 1).coerceIn(0, 3)) } catch (_: Exception) {}
+                try { if (ep == epoch) play(f, 1.0f + 0.1f * (inFlight.get() - 1).coerceIn(0, 5)) } catch (_: Exception) {}
                 f.delete()
                 if (ep == epoch) finishOne()
             }
@@ -125,7 +127,7 @@ object Speaker {
         if (p.pauseVideo && inFlight.get() == 0) Media.key(app, KeyEvent.KEYCODE_MEDIA_PAUSE)
         inFlight.incrementAndGet()
         start()
-        while (jobs.size >= 2) { if (jobs.pollFirst() != null) finishOne() }   // drop stale lines, keep the newest
+        while (jobs.size >= MAX_BACKLOG) { if (jobs.pollFirst() != null) finishOne() }   // only a very long backlog drops old lines
         jobs.put(Job(text, spk, epoch))
     }
 
@@ -138,9 +140,50 @@ object Speaker {
         return if (f0 == null) ready.first() else ready.minByOrNull { abs((State.profileF0[it] ?: 0f) - f0) }
     }
 
+    /** Reference to clone: the speaker heard in the video, else the manually chosen clip, else null. */
+    private fun refFor(ctx: Context, p: Prefs, spk: String): String? = try {
+        if (p.autoRef) {
+            val pick = pickRef(spk)
+            if (pick != null) { ensureAuto(ctx, pick); pick }
+            else if (p.voiceId.isNotEmpty()) { ensureVoice(ctx, p); p.voiceId } else null
+        } else if (p.voiceId.isNotEmpty()) { ensureVoice(ctx, p); p.voiceId } else null
+    } catch (e: Exception) { State.status = "reference upload: ${e.message}"; null }
+
+    /** Tablet Hindi voice -> WAV file (instant, offline) -> Termux /convert makes it sound like the reference speaker. */
+    private fun synthLocal(ctx: Context, p: Prefs, text: String, spk: String): File {
+        val vid = refFor(ctx, p, spk)
+        val g = genderOf(p, if (spk.isNotEmpty()) spk else vid)
+        val raw = File(ctx.cacheDir, "d${System.nanoTime()}.wav")
+        val t0 = System.currentTimeMillis()
+        if (!DeviceTts.synthToFile(ctx, text, g, p.lang, raw)) {
+            raw.delete(); error("tablet voice failed (is Hindi voice data installed?)")
+        }
+        val t1 = System.currentTimeMillis()
+        if (vid == null) { State.status = "tablet voice, no reference yet (${t1 - t0} ms)"; return raw }
+        return try {
+            val body = MultipartBody.Builder().setType(MultipartBody.FORM)
+                .addFormDataPart("voice_id", vid).addFormDataPart("gender", g)
+                .addFormDataPart("file", "t.wav", raw.readBytes().toRequestBody("audio/wav".toMediaType()))
+                .build()
+            val req = Request.Builder().url("${serverFor(p, "local")}/convert").post(body).build()
+            Net.client.newCall(req).execute().use { r ->
+                if (!r.isSuccessful) error("HTTP ${r.code}")
+                val f = File(ctx.cacheDir, "t${System.nanoTime()}.wav")
+                f.writeBytes(r.body!!.bytes())
+                raw.delete()
+                State.status = "cloned $vid/$g: voice ${t1 - t0} ms + convert ${System.currentTimeMillis() - t1} ms"
+                f
+            }
+        } catch (e: Exception) {
+            State.status = "clone server problem (${e.message}) -> plain tablet voice"
+            raw
+        }
+    }
+
     private fun synth(ctx: Context, p: Prefs, text: String, spk: String): File {
         val engine = p.engine
-        val cloned = engine == "local" || engine == "chatterbox"
+        if (engine == "local") return synthLocal(ctx, p, text, spk)
+        val cloned = engine == "chatterbox"
         var vid = p.voiceId
         if (cloned && p.autoRef) {
             val pick = pickRef(spk)
