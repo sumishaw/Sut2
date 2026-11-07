@@ -128,7 +128,8 @@ class AudioCaptureService : Service() {
      * Each profile keeps a rolling buffer of its own latest 8 s of audio, saved (re-saved every >=20 s) as its clone reference.
      */
     private fun audioLoop() {
-        val buf = ShortArray(1024)
+        val buf = ShortArray(512)               // 32 ms hop: a gender change is seen within milliseconds
+        val win = ShortArray(1024)              // sliding 64 ms analysis window
         val profs = HashMap<String, Prof>()
         var cur: Prof? = null
         var score = 0.0
@@ -150,16 +151,21 @@ class AudioCaptureService : Service() {
             if (now < State.muteUntil) continue            // on-device TTS is speaking
             var e = 0.0
             for (s in buf) e += s.toDouble() * s
-            if (sqrt(e / buf.size) < 400) continue         // silence
+            if (sqrt(e / buf.size) < 250) continue         // silence
             State.audioLoud++
-            val f = f0(buf)
+            System.arraycopy(win, 512, win, 0, 512); System.arraycopy(buf, 0, win, 512, 512)
+            val f = f0(win)
             var opposite = false
             if (f > 0f) {
+                if (lastVoiced != 0L && now - lastVoiced > 250) score *= 0.2   // new turn: forget the previous speaker fast
                 lastVoiced = now
-                val w = ((lastConf - 0.4) / 0.35).coerceIn(0.3, 1.0)           // clear pitch counts more
-                val d = (9.86 * (ln(f.toDouble()) / ln(2.0) - mid) * w).coerceIn(-3.0, 3.0)
-                score = (score * 0.93 + d).coerceIn(-6.0, 6.0)
-                val want = if (score > 3.0) true else if (score < -3.0) false else null   // true = female
+                val w = ((lastConf - 0.4) / 0.3).coerceIn(0.5, 1.0)            // clear pitch counts more
+                val d = (13.0 * (ln(f.toDouble()) / ln(2.0) - mid) * w).coerceIn(-4.0, 4.0)
+                score = (score * 0.7 + d).coerceIn(-5.0, 5.0)
+                // one clear, clearly-other-gender frame flips immediately (no waiting)
+                if (lastConf >= 0.7f && f > 185f && score < 2.0) score = 2.0
+                if (lastConf >= 0.7f && f < 135f && score > -2.0) score = -2.0
+                val want = if (score >= 2.0) true else if (score <= -2.0) false else null   // true = female
                 val c0 = cur
                 if (c0 == null) {
                     if (want != null) cur = profFor(want, f)
