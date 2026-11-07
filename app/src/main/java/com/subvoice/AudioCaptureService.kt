@@ -32,6 +32,22 @@ import kotlin.math.abs
 import kotlin.math.ln
 import kotlin.math.sqrt
 
+/** Where the playing video is on screen (fractions 0..1), shared with the accessibility caption reader. */
+object VideoWatch {
+    @Volatile var l = 0f; @Volatile var t = 0f; @Volatile var r = 1f; @Volatile var b = 1f
+    @Volatile var lastActive = 0L
+    fun set(v: FloatArray) { l = v[0]; t = v[1]; r = v[2]; b = v[3]; lastActive = System.currentTimeMillis() }
+    fun off() { lastActive = 0L }
+    fun recent() = System.currentTimeMillis() - lastActive < 2500
+}
+
+/** Share (0..1) of the non-space characters that are Devanagari. */
+fun devShare(s: String): Double {
+    val x = s.filter { !it.isWhitespace() }
+    if (x.isEmpty()) return 0.0
+    return x.count { it.code in 0x0900..0x097F }.toDouble() / x.length
+}
+
 /**
  * One screen-capture permission powers:
  *  1. playback-audio capture -> pitch-based speaker gender + SEPARATE female/male clone references (8 s each)
@@ -250,31 +266,94 @@ class AudioCaptureService : Service() {
         if (vd != null) setupDisplay()
     }
 
+    // ---- playing-video detection: the video is the part of the screen whose pixels keep changing ----
+    private var prevLum: IntArray? = null
+    private var acc = FloatArray(0)
+    private val motionHist = ArrayDeque<Boolean>()
+
+    private fun longestRun(ok: BooleanArray): IntRange? {
+        var bestS = -1; var bestE = -1; var s = -1; var gap = 0
+        for (i in ok.indices) {
+            if (ok[i]) {
+                if (s < 0) s = i
+                gap = 0
+                if (i - s > bestE - bestS) { bestS = s; bestE = i }
+            } else if (s >= 0 && ++gap > 2) { s = -1; gap = 0 }
+        }
+        return if (bestS < 0) null else bestS..bestE
+    }
+
+    private fun resetMotion() { prevLum = null; motionHist.clear() }
+
+    /** Returns the playing video's rectangle (fractions l,t,r,b of the screen) or null when no video is playing. */
+    private fun videoRect(frame: Bitmap): FloatArray? {
+        val nw = (frame.width / 12).coerceAtLeast(8); val nh = (frame.height / 12).coerceAtLeast(8)
+        val small = Bitmap.createScaledBitmap(frame, nw, nh, true)
+        val px = IntArray(nw * nh); small.getPixels(px, 0, nw, 0, 0, nw, nh)
+        if (small !== frame) small.recycle()
+        val lum = IntArray(px.size) { val p = px[it]; (((p shr 16) and 255) * 3 + ((p shr 8) and 255) * 6 + (p and 255)) / 10 }
+        val prev = prevLum
+        if (prev == null || prev.size != lum.size) { prevLum = lum; acc = FloatArray(lum.size); motionHist.clear(); return null }
+        prevLum = lum
+        var moving = 0; var cnt = 0
+        val rows = IntArray(nh); val cols = IntArray(nw)
+        for (i in lum.indices) {
+            val mv = abs(lum[i] - prev[i]) > 3
+            if (mv) moving++
+            acc[i] = if (mv) 1f else acc[i] * 0.88f
+            if (acc[i] > 0.3f) { cnt++; rows[i / nw]++; cols[i % nw]++ }
+        }
+        // "playing" = a real share of the screen changes in most recent frames (a static page or one short scroll does not)
+        motionHist.addLast(moving >= lum.size * 0.05); while (motionHist.size > 8) motionHist.removeFirst()
+        if (!motionHist.last() || motionHist.count { it } < 5 || cnt < lum.size * 0.05) return null
+        val rowMax = rows.maxOrNull() ?: 0; val colMax = cols.maxOrNull() ?: 0
+        val r = longestRun(BooleanArray(nh) { rows[it] >= 2 && rows[it] >= 0.3 * rowMax }) ?: return null
+        val c = longestRun(BooleanArray(nw) { cols[it] >= 2 && cols[it] >= 0.3 * colMax }) ?: return null
+        if (r.last - r.first + 1 < nh * 0.2 || c.last - c.first + 1 < nw * 0.25) return null
+        return floatArrayOf(c.first / nw.toFloat(), r.first / nh.toFloat(), (c.last + 1) / nw.toFloat(), (r.last + 1) / nh.toFloat())
+    }
+
     private fun ocrLoop() {
         val am = getSystemService(AUDIO_SERVICE) as AudioManager
         val rc = recognizer ?: return
         while (running) {
             try {
                 val img = reader?.acquireLatestImage()
-                // read only while a video is playing and SubVoice's own screen is not in front
-                if (img != null && (State.appVisible || !am.isMusicActive)) { img.close(); State.ocrText = "(idle)" }
-                else if (img != null) {
+                // read only while audio is playing and SubVoice's own screen is not in front
+                if (img != null && (State.appVisible || !am.isMusicActive)) {
+                    img.close(); State.ocrText = "(idle)"; resetMotion(); VideoWatch.off()
+                } else if (img != null) {
                     val w = img.width; val h = img.height
                     val pl = img.planes[0]
                     val rowPad = pl.rowStride - pl.pixelStride * w
                     val full = Bitmap.createBitmap(w + rowPad / pl.pixelStride, h, Bitmap.Config.ARGB_8888)
                     full.copyPixelsFromBuffer(pl.buffer)
                     img.close()
-                    val top = (h * 0.6).toInt()
-                    val crop = Bitmap.createBitmap(full, 0, top, w, h - top)
-                    val cw = crop.width
-                    val res = Tasks.await(rc.process(InputImage.fromBitmap(crop, 0)))
-                    // subtitles are CENTRED; titles, comments and menus are left/right aligned
-                    val lines = res.textBlocks.flatMap { it.lines }.filter { l ->
-                        val b = l.boundingBox ?: return@filter false
-                        abs((b.left + b.right) / 2f - cw / 2f) < cw * 0.18f && b.width() < cw * 0.95f
-                    }.sortedBy { it.boundingBox!!.top }
-                    handleOcr(lines.joinToString(" ") { it.text })
+                    val frame = if (full.width == w) full else Bitmap.createBitmap(full, 0, 0, w, h)
+                    val vr = videoRect(frame)
+                    if (vr == null) {
+                        State.ocrText = "(no playing video detected - subtitles are read only from a playing video)"
+                    } else {
+                        VideoWatch.set(vr)
+                        val vx = (vr[0] * w).toInt().coerceIn(0, w - 2)
+                        val vy = (vr[1] * h).toInt().coerceIn(0, h - 2)
+                        val vw = minOf(((vr[2] - vr[0]) * w).toInt(), w - vx)
+                        val vh = minOf(((vr[3] - vr[1]) * h).toInt(), h - vy)
+                        val top = vy + (vh * 0.45).toInt()              // subtitles sit in the lower half of the VIDEO itself
+                        val ch = vy + vh - top
+                        if (vw >= 64 && ch >= 24) {
+                            val crop = Bitmap.createBitmap(frame, vx, top, vw, ch)
+                            val cw = crop.width
+                            val res = Tasks.await(rc.process(InputImage.fromBitmap(crop, 0)))
+                            // subtitles: centred in the video, small text, Hindi. Titles, watermarks, comments, menus fail this.
+                            val lines = res.textBlocks.flatMap { it.lines }.filter { l ->
+                                val b = l.boundingBox ?: return@filter false
+                                abs((b.left + b.right) / 2f - cw / 2f) < cw * 0.2f && b.width() < cw * 0.95f &&
+                                    b.height() <= vh * 0.10f && devShare(l.text) >= 0.5
+                            }.sortedBy { it.boundingBox!!.top }
+                            handleOcr(lines.joinToString(" ") { it.text })
+                        }
+                    }
                 }
             } catch (e: InterruptedException) { break
             } catch (e: Exception) { if (running) State.status = "OCR: ${e.message}" }
@@ -305,6 +384,7 @@ class AudioCaptureService : Service() {
         try { recognizer?.close() } catch (_: Exception) {}; recognizer = null
         try { proj?.stop() } catch (_: Exception) {}; proj = null
         State.capturing = false
+        resetMotion(); VideoWatch.off()
     }
 
     /** Stop button / notification: capture off, speech off, queues empty, display reset. */
