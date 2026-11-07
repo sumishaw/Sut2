@@ -29,6 +29,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.concurrent.thread
 import kotlin.math.abs
+import kotlin.math.ln
 import kotlin.math.sqrt
 
 /**
@@ -102,23 +103,25 @@ class AudioCaptureService : Service() {
     }
 
     /**
-     * Tracks WHO is speaking, and only by gender: exactly two voice profiles exist, "spk_f" (female) and "spk_m" (male).
-     * Normal changes of intonation inside one person's speech never switch anything. The profile changes only when the
-     * pitch has clearly stayed on the other side of the gender border for about a second (hysteresis: >185 Hz female,
-     * <150 Hz male, in between = undecided and nothing changes).
-     * Every profile keeps a rolling buffer of its own latest 8 s of audio, saved (and re-saved every >=20 s) as its clone reference.
+     * Tracks WHO is speaking, by gender. Exactly two voice profiles exist: "spk_f" (female) and "spk_m" (male).
+     *
+     * Every voiced frame adds evidence (log-likelihood ratio of its pitch: female ~205 Hz vs male ~120 Hz, border 157 Hz),
+     * weighted by how clear the pitch is, into a leaky score (>0 female, <0 male). Strongly pitched frames of the other
+     * gender flip the voice after ~3 frames (~0.2 s), while single bad frames (octave errors, background music) cannot.
+     * Each profile keeps a rolling buffer of its own latest 8 s of audio, saved (re-saved every >=20 s) as its clone reference.
      */
     private fun audioLoop() {
         val buf = ShortArray(1024)
-        val recent = ArrayDeque<Float>()
         val profs = HashMap<String, Prof>()
         var cur: Prof? = null
-        var against = 0
+        var score = 0.0
+        var lastVoiced = 0L
+        val mid = ln(157.0) / ln(2.0)
         val prefs = Prefs(this)
 
-        fun profFor(female: Boolean, med: Float): Prof {
+        fun profFor(female: Boolean, f: Float): Prof {
             val id = if (female) "spk_f" else "spk_m"
-            return profs.getOrPut(id) { Prof(id, med) }
+            return profs.getOrPut(id) { Prof(id, f) }
         }
 
         while (running) {
@@ -132,32 +135,33 @@ class AudioCaptureService : Service() {
             for (s in buf) e += s.toDouble() * s
             if (sqrt(e / buf.size) < 400) continue         // silence
             State.audioLoud++
-            val f = f0(buf, e)
+            val f = f0(buf)
+            var opposite = false
             if (f > 0f) {
-                recent.addLast(f); if (recent.size > 16) recent.removeFirst()
-                if (recent.size >= 8) {
-                    val med = recent.sorted()[recent.size / 2]
-                    val vote = when { med > 185f -> 1; med < 150f -> -1; else -> 0 }      // 1 = female, -1 = male
-                    val c0 = cur
-                    if (c0 == null) {
-                        cur = profFor(if (vote != 0) vote > 0 else med > 165f, med)
-                    } else if (vote != 0) {
-                        val curFemale = c0.id == "spk_f"
-                        if ((vote > 0) != curFemale) {
-                            if (++against >= 15) { cur = profFor(vote > 0, med); against = 0 }   // ~1 s of the other gender
-                        } else {
-                            against = 0; c0.f0 = c0.f0 * 0.95f + med * 0.05f
-                        }
-                    }
-                    cur?.let {
-                        State.speaker = it.id
-                        State.gender = if (it.id == "spk_f") "female" else "male"
-                        State.profileF0[it.id] = it.f0; it.lastUsed = now
-                    }
+                lastVoiced = now
+                val w = ((lastConf - 0.4) / 0.35).coerceIn(0.3, 1.0)           // clear pitch counts more
+                val d = (9.86 * (ln(f.toDouble()) / ln(2.0) - mid) * w).coerceIn(-3.0, 3.0)
+                score = (score * 0.93 + d).coerceIn(-6.0, 6.0)
+                val want = if (score > 3.0) true else if (score < -3.0) false else null   // true = female
+                val c0 = cur
+                if (c0 == null) {
+                    if (want != null) cur = profFor(want, f)
+                } else {
+                    val curFemale = c0.id == "spk_f"
+                    if (want != null && want != curFemale) cur = profFor(want, f)
+                    else if (want == curFemale) c0.f0 = c0.f0 * 0.95f + f * 0.05f
+                    opposite = (d > 1.5 && !curFemale) || (d < -1.5 && curFemale)
+                }
+                State.profileF0["_live"] = f; State.profileF0["_score"] = score.toFloat()
+                cur?.let {
+                    State.speaker = it.id
+                    State.gender = if (it.id == "spk_f") "female" else "male"
+                    State.profileF0[it.id] = it.f0; it.lastUsed = now
                 }
             }
             val c = cur ?: continue
             if (!prefs.autoRef) continue
+            if (now - lastVoiced > 500 || opposite) continue      // keep the reference clean: speech of this speaker only
             for (s in buf) { c.ring[c.pos] = s; c.pos = (c.pos + 1) % RING }
             c.filled = minOf(RING, c.filled + buf.size)
             val need = if (c.lastSave == 0L) 16000 * 5 else RING      // first reference after 5 s, then 8 s windows
@@ -184,19 +188,34 @@ class AudioCaptureService : Service() {
         }
     }
 
-    /** Normalised autocorrelation pitch estimate, 75-350 Hz, picking the SHORTEST strong peak (no octave-low errors). 0 = unvoiced. */
-    private fun f0(x: ShortArray, e: Double): Float {
+    @Volatile private var lastConf = 0f      // clarity (0..1) of the last pitch found
+
+    /**
+     * Pitch estimate 75-350 Hz by normalised autocorrelation of the pre-emphasised signal (pre-emphasis suppresses bass,
+     * rumble and music low end that used to fake a "male" pitch). Picks the SHORTEST strong peak, so no octave-low errors.
+     * 0 = unvoiced / unclear.
+     */
+    private fun f0(raw: ShortArray): Float {
+        val n = raw.size
+        val x = FloatArray(n)
+        var prev = 0f; var e = 0.0
+        for (i in 0 until n) {
+            val v = raw[i].toFloat()
+            x[i] = v - 0.95f * prev; prev = v
+            e += x[i].toDouble() * x[i]
+        }
+        if (e < 1.0) return 0f
         val r = DoubleArray(230)
         var best = 0.0
         for (lag in 46..213) {
             var c = 0.0; var i = 0
-            while (i < x.size - lag) { c += x[i].toDouble() * x[i + lag]; i++ }
+            while (i < n - lag) { c += x[i].toDouble() * x[i + lag]; i++ }
             r[lag] = c / e
             if (r[lag] > best) best = r[lag]
         }
         if (best < 0.45) return 0f
         for (lag in 47..212) {
-            if (r[lag] >= 0.88 * best && r[lag] >= r[lag - 1] && r[lag] >= r[lag + 1]) return 16000f / lag
+            if (r[lag] >= 0.88 * best && r[lag] >= r[lag - 1] && r[lag] >= r[lag + 1]) { lastConf = best.toFloat(); return 16000f / lag }
         }
         return 0f
     }
