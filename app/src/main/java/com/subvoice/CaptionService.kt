@@ -2,9 +2,11 @@ package com.subvoice
 
 import android.accessibilityservice.AccessibilityService
 import android.content.Context
+import android.graphics.Rect
 import android.media.AudioManager
 import android.os.Handler
 import android.os.Looper
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 
@@ -12,7 +14,10 @@ import android.view.accessibility.AccessibilityNodeInfo
 class CaptionService : AccessibilityService() {
     private var last = ""
     private var lastDbg = 0L
+    private var sw = 0
+    private var sh = 0
 
+    @Suppress("DEPRECATION")
     override fun onAccessibilityEvent(e: AccessibilityEvent?) {
         if (e == null || e.packageName == packageName) return
         State.pkg = e.packageName?.toString() ?: ""
@@ -20,6 +25,12 @@ class CaptionService : AccessibilityService() {
         if (!Prefs(this).enabled) return
         val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         if (!am.isMusicActive) return                      // only while a video/audio is playing
+        if (State.capturing && !VideoWatch.recent()) return   // capture running: only while a video is really on screen
+        run {
+            val dm = android.util.DisplayMetrics()
+            (getSystemService(Context.WINDOW_SERVICE) as WindowManager).defaultDisplay.getRealMetrics(dm)
+            sw = dm.widthPixels; sh = dm.heightPixels
+        }
         val root = rootInActiveWindow ?: return
         val now = System.currentTimeMillis()
         val dbg: MutableList<String>? = if (now - lastDbg > 1500) { lastDbg = now; mutableListOf() } else null
@@ -33,13 +44,30 @@ class CaptionService : AccessibilityService() {
         }
     }
 
+    /** A caption node counts only if it is Hindi, centred in the lower part of the playing video (or of the screen if no video info). */
+    private fun inVideo(n: AccessibilityNodeInfo, txt: String): Boolean {
+        if (devShare(txt) < 0.5) return false
+        if (sw <= 0 || sh <= 0) return true
+        val b = Rect(); n.getBoundsInScreen(b)
+        if (b.isEmpty) return false
+        val cx = (b.left + b.right) / 2f / sw
+        val cy = (b.top + b.bottom) / 2f / sh
+        if (State.capturing) {
+            val v = VideoWatch
+            val rw = v.r - v.l; val rh = v.b - v.t
+            return cx >= v.l && cx <= v.r && cy >= v.t + 0.4f * rh && cy <= v.b + 0.03f &&
+                kotlin.math.abs(cx - (v.l + v.r) / 2f) < 0.25f * rw
+        }
+        return cy > 0.5f && kotlin.math.abs(cx - 0.5f) < 0.25f
+    }
+
     private fun collect(n: AccessibilityNodeInfo?, out: StringBuilder, dbg: MutableList<String>?) {
         if (n == null) return
         val id = n.viewIdResourceName?.lowercase() ?: ""
         val txt = n.text?.toString()
         if (!txt.isNullOrBlank()) {
             if (dbg != null && dbg.size < 8) dbg.add(id.substringAfterLast('/') + ": " + txt.take(40))
-            if ((id.contains("caption") || id.contains("subtitle")) && !n.isClickable) out.append(txt).append(' ')
+            if ((id.contains("caption") || id.contains("subtitle")) && !n.isClickable && n.isVisibleToUser && inVideo(n, txt)) out.append(txt).append(' ')
         }
         for (i in 0 until n.childCount) collect(n.getChild(i), out, dbg)
     }
