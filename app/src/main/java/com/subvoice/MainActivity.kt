@@ -151,7 +151,7 @@ class MainActivity : android.app.Activity() {
                 }
                 status.text = "Capture: ${if (State.capturing) "RUNNING" else "stopped"}\nStatus: ${State.status}\nDetected voice: ${State.gender}\nCloned voice: $cl\nLast caption: ${State.lastCaption}"
                 dbgView.text = "Audio capture: frames=${State.audioFrames} loud=${State.audioLoud} speaker=${State.gender}\n" +
-                        "Current voice: ${State.speaker.ifEmpty { "?" }} (${State.gender})  clone refs: ${State.created.keys.sorted().joinToString()}\n" +
+                        "Current voice: ${State.speaker.ifEmpty { "?" }} (${State.gender})  live pitch=${State.profileF0["_live"]?.toInt() ?: 0} Hz  score=${State.profileF0["_score"]?.let { "%.1f".format(it) } ?: "-"}  clone refs: ${State.created.keys.sorted().joinToString()}\n" +
                         "Captions app: ${State.pkg} events=${State.events}\n${State.debug}\nOCR: ${State.ocrText}"
                 if (enabledSw.isChecked != p.enabled) enabledSw.isChecked = p.enabled
                 ui.postDelayed(this, 1000)
