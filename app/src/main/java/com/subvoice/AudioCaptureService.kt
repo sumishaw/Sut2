@@ -102,24 +102,23 @@ class AudioCaptureService : Service() {
     }
 
     /**
-     * Tracks who is speaking by pitch: a new voice profile is created when the pitch moves >15% for a
-     * sustained moment, and an existing profile is re-used when its pitch comes back. Every profile keeps a
-     * rolling buffer of its own latest 8 s of audio, saved (and re-saved every >=20 s) as its clone reference.
+     * Tracks WHO is speaking, and only by gender: exactly two voice profiles exist, "spk_f" (female) and "spk_m" (male).
+     * Normal changes of intonation inside one person's speech never switch anything. The profile changes only when the
+     * pitch has clearly stayed on the other side of the gender border for about a second (hysteresis: >185 Hz female,
+     * <150 Hz male, in between = undecided and nothing changes).
+     * Every profile keeps a rolling buffer of its own latest 8 s of audio, saved (and re-saved every >=20 s) as its clone reference.
      */
     private fun audioLoop() {
         val buf = ShortArray(1024)
         val recent = ArrayDeque<Float>()
-        val profs = ArrayList<Prof>()
+        val profs = HashMap<String, Prof>()
         var cur: Prof? = null
-        var dev = 0
-        var seq = 0
+        var against = 0
         val prefs = Prefs(this)
 
-        fun findOrCreate(med: Float): Prof {
-            profs.firstOrNull { abs(med / it.f0 - 1f) < 0.15f }?.let { return it }
-            if (profs.size >= 6) profs.minByOrNull { it.lastUsed }?.let { profs.remove(it) }
-            seq++
-            return Prof("spk_$seq", med).also { profs.add(it) }
+        fun profFor(female: Boolean, med: Float): Prof {
+            val id = if (female) "spk_f" else "spk_m"
+            return profs.getOrPut(id) { Prof(id, med) }
         }
 
         while (running) {
@@ -135,19 +134,26 @@ class AudioCaptureService : Service() {
             State.audioLoud++
             val f = f0(buf, e)
             if (f > 0f) {
-                recent.addLast(f); if (recent.size > 12) recent.removeFirst()
+                recent.addLast(f); if (recent.size > 16) recent.removeFirst()
                 if (recent.size >= 8) {
                     val med = recent.sorted()[recent.size / 2]
-                    State.gender = if (med > 165f) "female" else "male"
+                    val vote = when { med > 185f -> 1; med < 150f -> -1; else -> 0 }      // 1 = female, -1 = male
                     val c0 = cur
                     if (c0 == null) {
-                        cur = findOrCreate(med)
-                    } else if (abs(med / c0.f0 - 1f) > 0.15f) {
-                        if (++dev >= 6) { cur = findOrCreate(med); dev = 0 }
-                    } else {
-                        dev = 0; c0.f0 = c0.f0 * 0.95f + med * 0.05f
+                        cur = profFor(if (vote != 0) vote > 0 else med > 165f, med)
+                    } else if (vote != 0) {
+                        val curFemale = c0.id == "spk_f"
+                        if ((vote > 0) != curFemale) {
+                            if (++against >= 15) { cur = profFor(vote > 0, med); against = 0 }   // ~1 s of the other gender
+                        } else {
+                            against = 0; c0.f0 = c0.f0 * 0.95f + med * 0.05f
+                        }
                     }
-                    cur?.let { State.speaker = it.id; State.profileF0[it.id] = it.f0; it.lastUsed = now }
+                    cur?.let {
+                        State.speaker = it.id
+                        State.gender = if (it.id == "spk_f") "female" else "male"
+                        State.profileF0[it.id] = it.f0; it.lastUsed = now
+                    }
                 }
             }
             val c = cur ?: continue
@@ -178,16 +184,21 @@ class AudioCaptureService : Service() {
         }
     }
 
-    /** Normalised autocorrelation pitch estimate, 70-400 Hz. 0 = unvoiced. */
+    /** Normalised autocorrelation pitch estimate, 75-350 Hz, picking the SHORTEST strong peak (no octave-low errors). 0 = unvoiced. */
     private fun f0(x: ShortArray, e: Double): Float {
-        var best = 0.0; var bl = 0
-        for (lag in 40..228) {
+        val r = DoubleArray(230)
+        var best = 0.0
+        for (lag in 46..213) {
             var c = 0.0; var i = 0
             while (i < x.size - lag) { c += x[i].toDouble() * x[i + lag]; i++ }
-            val r = c / e
-            if (r > best) { best = r; bl = lag }
+            r[lag] = c / e
+            if (r[lag] > best) best = r[lag]
         }
-        return if (best > 0.45 && bl > 0) 16000f / bl else 0f
+        if (best < 0.45) return 0f
+        for (lag in 47..212) {
+            if (r[lag] >= 0.88 * best && r[lag] >= r[lag - 1] && r[lag] >= r[lag + 1]) return 16000f / lag
+        }
+        return 0f
     }
 
     // ---------------- screen OCR (centred subtitle lines only) ----------------
