@@ -56,20 +56,18 @@ object Speaker {
     @Volatile private var curMp: MediaPlayer? = null
     @Volatile private var curLatch: CountDownLatch? = null
 
-    private val lastGender = java.util.concurrent.ConcurrentHashMap<String, String>()
-
-    /** female/male for a speaker. Auto mode uses pitch with hysteresis so the voice does not flip-flop near the border. */
+    /**
+     * female/male for a speaker profile. Profiles are per gender ("spk_f" / "spk_m"), so the gender is simply the
+     * profile that was heard; it only changes when the video really changes from a female to a male voice (or back).
+     */
     private fun genderOf(p: Prefs, vid: String?): String {
         if (p.genderMode != "auto") return p.genderMode
-        val key = vid ?: return State.gender
-        val f0 = State.profileF0[key] ?: return State.gender
-        val g = when {
-            f0 > 180f -> "female"
-            f0 < 150f -> "male"
-            else -> lastGender[key] ?: if (f0 > 165f) "female" else "male"
+        return when {
+            vid == null -> State.gender
+            vid.startsWith("spk_f") -> "female"
+            vid.startsWith("spk_m") -> "male"
+            else -> State.gender
         }
-        lastGender[key] = g
-        return g
     }
 
     fun serverFor(p: Prefs, engine: String) = when (engine) {
@@ -87,7 +85,7 @@ object Speaker {
     /** Stop everything right now: queued lines, the line being played, device speech. */
     fun stopAll(ctx: Context) {
         epoch++
-        jobs.clear(); lastGender.clear()
+        jobs.clear()
         playQ.forEach { it.delete() }; playQ.clear()
         val busy = inFlight.getAndSet(0) > 0
         curLatch?.countDown()
@@ -141,14 +139,12 @@ object Speaker {
         jobs.put(Job(text, spk, epoch))
     }
 
-    /** Reference of the speaker heard when the line appeared, or the closest-pitched available one. */
-    private fun pickRef(spk: String): String? {
-        val ready = State.created.keys.toList()
-        if (ready.isEmpty()) return null
-        if (spk.isNotEmpty() && spk in ready) return spk
-        val f0 = State.profileF0[spk] ?: State.profileF0[State.speaker]
-        return if (f0 == null) ready.first() else ready.minByOrNull { abs((State.profileF0[it] ?: 0f) - f0) }
-    }
+    /**
+     * Reference of the speaker heard when the line appeared. A reference of the OTHER gender is never borrowed
+     * (that is what made female lines sound male): until this speaker's own reference exists, null = plain tablet voice.
+     */
+    private fun pickRef(spk: String): String? =
+        if (spk.isNotEmpty() && spk in State.created.keys) spk else null
 
     /** Reference to clone: the speaker heard in the video, else the manually chosen clip, else null. */
     private fun refFor(ctx: Context, p: Prefs, spk: String): String? = try {
