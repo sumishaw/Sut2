@@ -110,8 +110,8 @@ class MainActivity : android.app.Activity() {
         root.addView(label("On-device Hindi voices (offline engine)"))
         femAd = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, mutableListOf("(loading voices...)"))
         maleAd = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, mutableListOf("(loading voices...)"))
-        root.addView(label("Female voice - default Voice II (tap one to hear it; Voice I, II, III, IV = order in system Hindi (India) voices)")); femSp = voiceSpin(femAd, "female"); root.addView(femSp)
-        root.addView(label("Male voice - default Voice IV (tap one to hear it)")); maleSp = voiceSpin(maleAd, "male"); root.addView(maleSp)
+        root.addView(label("Female voice - Voice I or II (tap one to hear it; the app measures each voice and never uses a male-sounding voice here)")); femSp = voiceSpin(femAd, "female"); root.addView(femSp)
+        root.addView(label("Male voice - Voice III or IV (tap one to hear it)")); maleSp = voiceSpin(maleAd, "male"); root.addView(maleSp)
         root.addView(btn("Install / update Hindi voice data") {
             try { startActivity(Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA)) }
             catch (e: Exception) { startActivity(Intent("com.android.settings.TTS_SETTINGS")) }
@@ -159,16 +159,19 @@ class MainActivity : android.app.Activity() {
         })
     }
 
-    private fun loadVoices() = DeviceTts.init(this) {
-        runOnUiThread {
-            val vs = DeviceTts.installedVoices("hi")
-            voiceNames = vs.map { it.name }
-            val labels = if (vs.isEmpty()) listOf("(no Hindi voice installed)") else vs.mapIndexed { i, v -> DeviceTts.label(i, v) }
-            for ((ad, sp, g) in listOf(Triple(femAd, femSp, "female"), Triple(maleAd, maleSp, "male"))) {
-                ad.clear(); ad.addAll(labels); ad.notifyDataSetChanged()
-                sp.setSelection(voiceNames.indexOf(DeviceTts.resolveName(p, g)).coerceAtLeast(0))
-            }
+    private fun fillVoices() {
+        val vs = DeviceTts.installedVoices("hi")
+        voiceNames = vs.map { it.name }
+        val labels = if (vs.isEmpty()) listOf("(no Hindi voice installed)") else vs.mapIndexed { i, v -> DeviceTts.label(i, v) }
+        for ((ad, sp, g) in listOf(Triple(femAd, femSp, "female"), Triple(maleAd, maleSp, "male"))) {
+            ad.clear(); ad.addAll(labels); ad.notifyDataSetChanged()
+            sp.setSelection(voiceNames.indexOf(DeviceTts.resolveName(p, g)).coerceAtLeast(0))
         }
+    }
+
+    private fun loadVoices() = DeviceTts.init(this) {
+        runOnUiThread { fillVoices() }
+        DeviceTts.calibrate(this) { runOnUiThread { fillVoices() } }     // shows [female/male ~Hz] once measured
     }
 
     private fun save() { p.xttsUrl = xtts.text.toString(); p.cbUrl = cb.text.toString(); p.localUrl = local.text.toString(); p.lang = lang.text.toString() }
