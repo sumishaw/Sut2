@@ -17,8 +17,8 @@ class Prefs(c: Context) {
     var lang: String get() = str("lang", "hi"); set(v) = put("lang", v.trim())
     var voiceId: String get() = str("voice", ""); set(v) = put("voice", v)
     var uploadedTo: String get() = str("upto", ""); set(v) = put("upto", v)
-    var devFemale: String get() = str("devF", ""); set(v) = put("devF", v)
-    var devMale: String get() = str("devM", ""); set(v) = put("devM", v)
+    var devFemale: String get() = str("devF2", ""); set(v) = put("devF2", v)
+    var devMale: String get() = str("devM2", ""); set(v) = put("devM2", v)
     var fallback: Boolean get() = bool("fb", true); set(v) = putB("fb", v)
     var enabled: Boolean get() = bool("enabled", true); set(v) = putB("enabled", v)
     var autoRef: Boolean get() = bool("auto", true); set(v) = putB("auto", v)         // clone the video's own speaker
