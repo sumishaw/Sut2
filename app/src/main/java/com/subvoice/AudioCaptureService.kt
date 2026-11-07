@@ -36,6 +36,7 @@ import kotlin.math.sqrt
 object VideoWatch {
     @Volatile var l = 0f; @Volatile var t = 0f; @Volatile var r = 1f; @Volatile var b = 1f
     @Volatile var lastActive = 0L
+    @Volatile var tracking = false          // true while the screen reader is running (so a video rectangle can be known)
     fun set(v: FloatArray) { l = v[0]; t = v[1]; r = v[2]; b = v[3]; lastActive = System.currentTimeMillis() }
     fun off() { lastActive = 0L }
     fun recent() = System.currentTimeMillis() - lastActive < 2500
@@ -242,7 +243,9 @@ class AudioCaptureService : Service() {
     private fun setupDisplay() {
         val dm = DisplayMetrics()
         (getSystemService(WINDOW_SERVICE) as WindowManager).defaultDisplay.getRealMetrics(dm)
-        val w = dm.widthPixels / 2; val h = dm.heightPixels / 2
+        // up to 1920 px on the long side: subtitles of a small embedded (browser) player need real detail for OCR
+        val sc = minOf(1f, 1920f / maxOf(dm.widthPixels, dm.heightPixels))
+        val w = (dm.widthPixels * sc).toInt(); val h = (dm.heightPixels * sc).toInt()
         val r = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
         val old = reader
         if (vd == null) {
@@ -258,6 +261,7 @@ class AudioCaptureService : Service() {
     private fun startOcr() {
         recognizer = TextRecognition.getClient(DevanagariTextRecognizerOptions.Builder().build())
         setupDisplay()
+        VideoWatch.tracking = true
         ocrT = thread(name = "ocr") { ocrLoop() }
     }
 
@@ -271,21 +275,13 @@ class AudioCaptureService : Service() {
     private var acc = FloatArray(0)
     private val motionHist = ArrayDeque<Boolean>()
 
-    private fun longestRun(ok: BooleanArray): IntRange? {
-        var bestS = -1; var bestE = -1; var s = -1; var gap = 0
-        for (i in ok.indices) {
-            if (ok[i]) {
-                if (s < 0) s = i
-                gap = 0
-                if (i - s > bestE - bestS) { bestS = s; bestE = i }
-            } else if (s >= 0 && ++gap > 2) { s = -1; gap = 0 }
-        }
-        return if (bestS < 0) null else bestS..bestE
-    }
-
     private fun resetMotion() { prevLum = null; motionHist.clear() }
 
-    /** Returns the playing video's rectangle (fractions l,t,r,b of the screen) or null when no video is playing. */
+    /**
+     * Returns the playing video's rectangle (fractions l,t,r,b of the screen) or null when no video is playing.
+     * Moving cells are grouped into connected areas; the biggest one with a video-like shape is the player. Ads, GIFs and
+     * other animated bits of a web page are separate areas and are ignored, so a player embedded in a page is found exactly.
+     */
     private fun videoRect(frame: Bitmap): FloatArray? {
         val nw = (frame.width / 12).coerceAtLeast(8); val nh = (frame.height / 12).coerceAtLeast(8)
         val small = Bitmap.createScaledBitmap(frame, nw, nh, true)
@@ -295,22 +291,53 @@ class AudioCaptureService : Service() {
         val prev = prevLum
         if (prev == null || prev.size != lum.size) { prevLum = lum; acc = FloatArray(lum.size); motionHist.clear(); return null }
         prevLum = lum
-        var moving = 0; var cnt = 0
-        val rows = IntArray(nh); val cols = IntArray(nw)
+        var moving = 0
+        val mask = BooleanArray(lum.size)
         for (i in lum.indices) {
             val mv = abs(lum[i] - prev[i]) > 3
             if (mv) moving++
             acc[i] = if (mv) 1f else acc[i] * 0.88f
-            if (acc[i] > 0.3f) { cnt++; rows[i / nw]++; cols[i % nw]++ }
+            mask[i] = acc[i] > 0.3f
         }
         // "playing" = a real share of the screen changes in most recent frames (a static page or one short scroll does not)
-        motionHist.addLast(moving >= lum.size * 0.05); while (motionHist.size > 8) motionHist.removeFirst()
-        if (!motionHist.last() || motionHist.count { it } < 5 || cnt < lum.size * 0.05) return null
-        val rowMax = rows.maxOrNull() ?: 0; val colMax = cols.maxOrNull() ?: 0
-        val r = longestRun(BooleanArray(nh) { rows[it] >= 2 && rows[it] >= 0.3 * rowMax }) ?: return null
-        val c = longestRun(BooleanArray(nw) { cols[it] >= 2 && cols[it] >= 0.3 * colMax }) ?: return null
-        if (r.last - r.first + 1 < nh * 0.2 || c.last - c.first + 1 < nw * 0.25) return null
-        return floatArrayOf(c.first / nw.toFloat(), r.first / nh.toFloat(), (c.last + 1) / nw.toFloat(), (r.last + 1) / nh.toFloat())
+        motionHist.addLast(moving >= lum.size * 0.02); while (motionHist.size > 8) motionHist.removeFirst()
+        if (!motionHist.last() || motionHist.count { it } < 4) return null
+
+        // connected moving areas (cells up to 2 apart belong together)
+        val seen = BooleanArray(lum.size)
+        val stack = IntArray(lum.size)
+        var bestCnt = 0; var bx0 = 0; var by0 = 0; var bx1 = 0; var by1 = 0; var bestShape = false
+        for (start in lum.indices) {
+            if (!mask[start] || seen[start]) continue
+            var sp = 0; stack[sp++] = start; seen[start] = true
+            var cnt = 0; var x0 = nw; var x1 = 0; var y0 = nh; var y1 = 0
+            while (sp > 0) {
+                val cell = stack[--sp]; cnt++
+                val cx = cell % nw; val cy = cell / nw
+                if (cx < x0) x0 = cx; if (cx > x1) x1 = cx; if (cy < y0) y0 = cy; if (cy > y1) y1 = cy
+                for (dy in -2..2) for (dx in -2..2) {
+                    val ny = cy + dy; val nx = cx + dx
+                    if (ny < 0 || ny >= nh || nx < 0 || nx >= nw) continue
+                    val ni = ny * nw + nx
+                    if (mask[ni] && !seen[ni]) { seen[ni] = true; stack[sp++] = ni }
+                }
+            }
+            val aspect = (x1 - x0 + 1).toFloat() / (y1 - y0 + 1)
+            val shape = aspect in 0.4f..3.5f
+            // a video-shaped area always beats an odd-shaped one; otherwise the bigger one wins
+            if ((shape && !bestShape) || (shape == bestShape && cnt > bestCnt)) {
+                bestCnt = cnt; bx0 = x0; bx1 = x1; by0 = y0; by1 = y1; bestShape = shape
+            }
+        }
+        if (bestCnt < lum.size * 0.025) return null
+        val bw = bx1 - bx0 + 1; val bh = by1 - by0 + 1
+        if (bw < nw * 0.12 || bh < nh * 0.08) return null
+        // letterboxed films keep their subtitles in the (static) black bar under the picture: extend a little downwards and sideways
+        val l = (bx0 - nw * 0.02f).coerceAtLeast(0f) / nw
+        val r = (bx1 + 1 + nw * 0.02f).coerceAtMost(nw.toFloat()) / nw
+        val t = by0.toFloat() / nh
+        val b = (by1 + 1 + bh * 0.15f).coerceAtMost(nh.toFloat()) / nh
+        return floatArrayOf(l, t, r, b)
     }
 
     private fun ocrLoop() {
@@ -339,21 +366,31 @@ class AudioCaptureService : Service() {
                         val vy = (vr[1] * h).toInt().coerceIn(0, h - 2)
                         val vw = minOf(((vr[2] - vr[0]) * w).toInt(), w - vx)
                         val vh = minOf(((vr[3] - vr[1]) * h).toInt(), h - vy)
-                        val top = vy + (vh * 0.45).toInt()              // subtitles sit in the lower half of the VIDEO itself
+                        val top = vy + (vh * 0.35).toInt()              // subtitles sit in the lower part of the VIDEO itself
                         val ch = vy + vh - top
                         if (vw >= 64 && ch >= 24) {
                             val crop = Bitmap.createBitmap(frame, vx, top, vw, ch)
-                            val cw = crop.width
-                            val res = Tasks.await(rc.process(InputImage.fromBitmap(crop, 0)))
-                            // subtitles: centred in the video, small text, Hindi. Titles, watermarks, comments, menus fail this.
+                            // small embedded players have small text: enlarge the crop so the Hindi OCR can read it
+                            val sc = if (ch < 260) 2f else 1f
+                            val shot = if (sc == 1f) crop else Bitmap.createScaledBitmap(crop, (vw * sc).toInt(), (ch * sc).toInt(), true)
+                            val cw = shot.width
+                            val res = Tasks.await(rc.process(InputImage.fromBitmap(shot, 0)))
+                            // subtitles: centred in the video, not huge, Hindi. Titles, watermarks, comments, menus fail this.
                             val lines = res.textBlocks.flatMap { it.lines }.filter { l ->
                                 val b = l.boundingBox ?: return@filter false
-                                abs((b.left + b.right) / 2f - cw / 2f) < cw * 0.2f && b.width() < cw * 0.95f &&
-                                    b.height() <= vh * 0.10f && devShare(l.text) >= 0.5
+                                abs((b.left + b.right) / 2f - cw / 2f) < cw * 0.25f && b.width() < cw * 0.97f &&
+                                    b.height() <= vh * sc * 0.16f && devShare(l.text) >= 0.5
                             }.sortedBy { it.boundingBox!!.top }
-                            handleOcr(lines.joinToString(" ") { it.text })
+                            val joined = lines.joinToString(" ") { it.text }
+                            handleOcr(joined)
+                            if (joined.isBlank())
+                                State.ocrText = "(video found ${vw}x${vh}; no Hindi subtitle line. saw: ${res.text.replace('\n', ' ').take(40)})"
+                            if (shot !== crop) shot.recycle()
+                            crop.recycle()
                         }
                     }
+                    if (frame !== full) frame.recycle()
+                    full.recycle()
                 }
             } catch (e: InterruptedException) { break
             } catch (e: Exception) { if (running) State.status = "OCR: ${e.message}" }
@@ -384,7 +421,7 @@ class AudioCaptureService : Service() {
         try { recognizer?.close() } catch (_: Exception) {}; recognizer = null
         try { proj?.stop() } catch (_: Exception) {}; proj = null
         State.capturing = false
-        resetMotion(); VideoWatch.off()
+        resetMotion(); VideoWatch.off(); VideoWatch.tracking = false
     }
 
     /** Stop button / notification: capture off, speech off, queues empty, display reset. */
