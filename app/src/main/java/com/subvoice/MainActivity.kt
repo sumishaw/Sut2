@@ -110,8 +110,8 @@ class MainActivity : android.app.Activity() {
         root.addView(label("On-device Hindi voices (offline engine)"))
         femAd = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, mutableListOf("(loading voices...)"))
         maleAd = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, mutableListOf("(loading voices...)"))
-        root.addView(label("Female voice - Voice I or II (tap one to hear it; the app measures each voice and never uses a male-sounding voice here)")); femSp = voiceSpin(femAd, "female"); root.addView(femSp)
-        root.addView(label("Male voice - Voice III or IV (tap one to hear it)")); maleSp = voiceSpin(maleAd, "male"); root.addView(maleSp)
+        root.addView(label("Female voice - Voice II first, Voice I second (tap one to hear it; the app measures each voice and never uses a male-sounding voice here)")); femSp = voiceSpin(femAd, "female"); root.addView(femSp)
+        root.addView(label("Male voice - Voice IV first, Voice III second (tap one to hear it)")); maleSp = voiceSpin(maleAd, "male"); root.addView(maleSp)
         root.addView(btn("Install / update Hindi voice data") {
             try { startActivity(Intent(TextToSpeech.Engine.ACTION_INSTALL_TTS_DATA)) }
             catch (e: Exception) { startActivity(Intent("com.android.settings.TTS_SETTINGS")) }
