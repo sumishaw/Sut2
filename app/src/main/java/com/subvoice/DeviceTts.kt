@@ -16,7 +16,7 @@ import java.util.concurrent.TimeUnit
  *
  * Voice numbering: Google lists the installed Hindi voices as "Voice I, II, III, IV" in system settings.
  * The Android API does not expose those display names, so they are matched by order of the installed voices.
- * Mapping: Voice I, II = FEMALE;  Voice III, IV = MALE.
+ * Preference: FEMALE = Voice II first, then Voice I;  MALE = Voice IV first, then Voice III.
  * Because that numbering is only a guess, every voice is MEASURED once (its real pitch is analysed) and a voice is
  * never used for the wrong gender, whatever its name or position is.
  */
@@ -28,10 +28,15 @@ object DeviceTts {
 
     private class Waiter { val latch = CountDownLatch(1); @Volatile var ok = false }
     private val waiters = ConcurrentHashMap<String, Waiter>()
+    private val speaking = java.util.concurrent.atomic.AtomicInteger(0)
+    private fun endSpeak(id: String?) {
+        if (id?.startsWith("u") != true) return
+        if (speaking.decrementAndGet() <= 0) { speaking.set(0); State.muteUntil = System.currentTimeMillis() + 150 }
+    }
 
     private val ROMAN = listOf("I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X")
-    private val FEMALE_PREF = listOf(0, 1)  // Voice I, then Voice II
-    private val MALE_PREF = listOf(2, 3)    // Voice III, then Voice IV
+    private val FEMALE_PREF = listOf(1, 0)  // Voice II first, then Voice I
+    private val MALE_PREF = listOf(3, 2)    // Voice IV first, then Voice III
     private val vf0 = ConcurrentHashMap<String, Float>()     // measured pitch (Hz) of each installed voice
     private val calLock = Any()
     @Volatile private var appCtx: Context? = null
@@ -46,10 +51,10 @@ object DeviceTts {
                 ready = st == TextToSpeech.SUCCESS
                 if (ready) {
                     tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                        override fun onStart(id: String?) {}
-                        override fun onDone(id: String?) { waiters.remove(id)?.let { it.ok = true; it.latch.countDown() } }
-                        @Deprecated("old callback") override fun onError(id: String?) { waiters.remove(id)?.latch?.countDown() }
-                        override fun onError(id: String?, code: Int) { waiters.remove(id)?.latch?.countDown() }
+                        override fun onStart(id: String?) { if (id?.startsWith("u") == true) { speaking.incrementAndGet(); State.muteUntil = Long.MAX_VALUE } }
+                        override fun onDone(id: String?) { endSpeak(id); waiters.remove(id)?.let { it.ok = true; it.latch.countDown() } }
+                        @Deprecated("old callback") override fun onError(id: String?) { endSpeak(id); waiters.remove(id)?.latch?.countDown() }
+                        override fun onError(id: String?, code: Int) { endSpeak(id); waiters.remove(id)?.latch?.countDown() }
                     })
                     val cbs = synchronized(pendingCb) { val c = ArrayList(pendingCb); pendingCb.clear(); c }
                     cbs.forEach { try { it() } catch (_: Exception) {} }
@@ -63,7 +68,7 @@ object DeviceTts {
         }
     }
 
-    fun stop() { try { tts?.stop() } catch (_: Exception) {} }
+    fun stop() { try { tts?.stop() } catch (_: Exception) {}; speaking.set(0); State.muteUntil = 0L }
 
     /** Installed, offline voices of a language in a stable order (this order = Voice I, II, III, IV ...). */
     fun installedVoices(lang: String): List<Voice> {
@@ -90,7 +95,7 @@ object DeviceTts {
 
     /**
      * The voice that will really be used for a gender: the saved choice (only if it really is that gender),
-     * else Voice I / II (female) or Voice III / IV (male), else any measured voice of that gender.
+     * else Voice II then I (female) or Voice IV then III (male), else any measured voice of that gender.
      */
     fun resolveName(p: Prefs, gender: String): String? {
         val list = installedVoices("hi")
@@ -213,7 +218,7 @@ object DeviceTts {
         val p = Prefs(ctx)
         synchronized(lock) {
             if (!applyVoice(t, p, gender, lang, 1.1f)) return
-            State.muteUntil = System.currentTimeMillis() + maxOf(2500L, text.length * 90L)
+            State.muteUntil = System.currentTimeMillis() + 1500L   // safety; exact end is set by the TTS callbacks
             t.speak(text, TextToSpeech.QUEUE_ADD, null, "u${System.nanoTime()}")
         }
         State.status = "spoke (device/$gender)"
