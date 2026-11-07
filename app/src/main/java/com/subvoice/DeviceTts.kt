@@ -15,8 +15,10 @@ import java.util.concurrent.TimeUnit
  * Fully offline speech using the tablet's own TTS engine (Google Speech Services Hindi voices).
  *
  * Voice numbering: Google lists the installed Hindi voices as "Voice I, II, III, IV" in system settings.
- * The Android API does not expose those display names, so they are matched by order of the installed
- * local voices. Default: FEMALE = Voice II, MALE = Voice IV (can be changed in the app).
+ * The Android API does not expose those display names, so they are matched by order of the installed voices.
+ * Mapping: Voice I, II = FEMALE;  Voice III, IV = MALE.
+ * Because that numbering is only a guess, every voice is MEASURED once (its real pitch is analysed) and a voice is
+ * never used for the wrong gender, whatever its name or position is.
  */
 object DeviceTts {
     private var tts: TextToSpeech? = null
@@ -28,10 +30,14 @@ object DeviceTts {
     private val waiters = ConcurrentHashMap<String, Waiter>()
 
     private val ROMAN = listOf("I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X")
-    private const val FEMALE_INDEX = 1      // Voice II
-    private const val MALE_INDEX = 3        // Voice IV
+    private val FEMALE_PREF = listOf(0, 1)  // Voice I, then Voice II
+    private val MALE_PREF = listOf(2, 3)    // Voice III, then Voice IV
+    private val vf0 = ConcurrentHashMap<String, Float>()     // measured pitch (Hz) of each installed voice
+    private val calLock = Any()
+    @Volatile private var appCtx: Context? = null
 
     fun init(ctx: Context, onReady: (() -> Unit)? = null) {
+        appCtx = ctx.applicationContext
         synchronized(pendingCb) {
             if (ready) { onReady?.invoke(); return }
             if (onReady != null) pendingCb.add(onReady)
@@ -47,6 +53,7 @@ object DeviceTts {
                     })
                     val cbs = synchronized(pendingCb) { val c = ArrayList(pendingCb); pendingCb.clear(); c }
                     cbs.forEach { try { it() } catch (_: Exception) {} }
+                    calibrate(ctx.applicationContext, null)          // measure the real gender of every voice (once)
                 } else {
                     State.status = "Device TTS init failed"
                     synchronized(pendingCb) { pendingCb.clear() }
@@ -69,16 +76,118 @@ object DeviceTts {
         return (if (local.isNotEmpty()) local else all).sortedBy { it.name }
     }
 
-    fun label(index: Int, v: Voice): String = "Voice ${ROMAN.getOrElse(index) { (index + 1).toString() }}  (${v.name})"
+    /** "female" / "male" from the measured pitch of the voice, or null if it has not been measured yet. */
+    fun genderOfVoice(name: String): String? {
+        val f = vf0[name] ?: appCtx?.getSharedPreferences("subvoice", Context.MODE_PRIVATE)
+            ?.getFloat("vf0_$name", 0f)?.takeIf { it > 0f }?.also { vf0[name] = it }
+        return f?.let { if (it > 165f) "female" else "male" }
+    }
 
-    /** The voice that will really be used: the saved one if still installed, else Voice II (female) / Voice IV (male). */
+    fun label(index: Int, v: Voice): String {
+        val g = genderOfVoice(v.name)?.let { "  [$it ~${vf0[v.name]?.toInt()} Hz]" } ?: ""
+        return "Voice ${ROMAN.getOrElse(index) { (index + 1).toString() }}  (${v.name})$g"
+    }
+
+    /**
+     * The voice that will really be used for a gender: the saved choice (only if it really is that gender),
+     * else Voice I / II (female) or Voice III / IV (male), else any measured voice of that gender.
+     */
     fun resolveName(p: Prefs, gender: String): String? {
         val list = installedVoices("hi")
         if (list.isEmpty()) return null
+        fun ok(n: String) = genderOfVoice(n).let { it == null || it == gender }
         val saved = if (gender == "male") p.devMale else p.devFemale
-        list.firstOrNull { it.name == saved }?.let { return it.name }
-        val idx = if (gender == "male") MALE_INDEX else FEMALE_INDEX
-        return list[minOf(idx, list.size - 1)].name
+        list.firstOrNull { it.name == saved && ok(it.name) }?.let { return it.name }
+        val pref = if (gender == "male") MALE_PREF else FEMALE_PREF
+        for (i in pref) list.getOrNull(i)?.let { if (ok(it.name)) return it.name }
+        list.firstOrNull { genderOfVoice(it.name) == gender }?.let { return it.name }
+        return list[minOf(pref[0], list.size - 1)].name
+    }
+
+    /** Measures the pitch of every installed Hindi voice once (cached), so gender never depends on guessing. */
+    fun calibrate(ctx: Context, done: (() -> Unit)?) {
+        Thread {
+            synchronized(calLock) {
+                try {
+                    val t = tts
+                    if (ready && t != null) {
+                        for (v in installedVoices("hi")) {
+                            if (genderOfVoice(v.name) != null) continue
+                            val f = File(ctx.cacheDir, "cal${System.nanoTime()}.wav")
+                            try {
+                                if (renderWithVoice(t, v.name, "नमस्ते, आज मौसम बहुत अच्छा है, आप सब कैसे हैं।", f)) {
+                                    val hz = wavF0(f)
+                                    if (hz > 0f) {
+                                        vf0[v.name] = hz
+                                        ctx.getSharedPreferences("subvoice", Context.MODE_PRIVATE).edit().putFloat("vf0_${v.name}", hz).apply()
+                                    }
+                                }
+                            } finally { f.delete() }
+                        }
+                    }
+                } catch (_: Exception) {}
+            }
+            try { done?.invoke() } catch (_: Exception) {}
+        }.start()
+    }
+
+    private fun renderWithVoice(t: TextToSpeech, name: String, text: String, out: File): Boolean {
+        val id = "c${System.nanoTime()}"
+        val w = Waiter()
+        synchronized(lock) {
+            t.setLanguage(Locale.forLanguageTag("hi-IN"))
+            val v = t.voices?.firstOrNull { it.name == name } ?: return false
+            t.setVoice(v); t.setPitch(1f); t.setSpeechRate(1f)
+            waiters[id] = w
+            if (t.synthesizeToFile(text, Bundle(), out, id) != TextToSpeech.SUCCESS) { waiters.remove(id); return false }
+        }
+        w.latch.await(10, TimeUnit.SECONDS)
+        waiters.remove(id)
+        return w.ok && out.exists() && out.length() > 100
+    }
+
+    /** Median pitch (Hz) of the voiced parts of a PCM16 WAV file; 0 if none found. */
+    private fun wavF0(f: File): Float {
+        val b = f.readBytes()
+        if (b.size < 64) return 0f
+        val bb = java.nio.ByteBuffer.wrap(b).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        val sr = bb.getInt(24)
+        var pos = 12; var off = -1; var len = 0
+        while (pos + 8 <= b.size) {
+            val id = String(b, pos, 4, Charsets.US_ASCII); val l = bb.getInt(pos + 4)
+            if (id == "data") { off = pos + 8; len = if (l < 0 || l > b.size - off) b.size - off else l; break }
+            if (l < 0) break
+            pos += 8 + l
+        }
+        if (off < 0 || sr < 8000) return 0f
+        val n = len / 2
+        val x = FloatArray(n) { bb.getShort(off + it * 2).toFloat() }
+        val frame = (sr * 0.045).toInt(); val hop = frame / 2
+        val lo = sr / 350; val hi = sr / 75
+        if (n < frame * 3) return 0f
+        val starts = (0..(n - frame) step hop).toList()
+        val rms = starts.map { s -> var e = 0.0; for (i in s until s + frame) e += x[i] * x[i]; Math.sqrt(e / frame) }
+        val peak = rms.maxOrNull() ?: return 0f
+        val out = ArrayList<Float>()
+        for ((k, s) in starts.withIndex()) {
+            if (rms[k] < 0.2 * peak) continue
+            var e = 0.0; for (i in s until s + frame) e += x[i].toDouble() * x[i]
+            val r = DoubleArray(hi + 2)
+            var best = 0.0
+            for (lag in lo..hi) {
+                var c = 0.0
+                for (i in s until s + frame - lag) c += x[i].toDouble() * x[i + lag]
+                r[lag] = c / e
+                if (r[lag] > best) best = r[lag]
+            }
+            if (best < 0.5) continue
+            for (lag in lo + 1 until hi) {
+                if (r[lag] >= 0.88 * best && r[lag] >= r[lag - 1] && r[lag] >= r[lag + 1]) { out.add(sr.toFloat() / lag); break }
+            }
+        }
+        if (out.size < 4) return 0f
+        out.sort()
+        return out[out.size / 2]
     }
 
     /** Must be called inside synchronized(lock). Sets language, then the exact voice, pitch and rate. */
